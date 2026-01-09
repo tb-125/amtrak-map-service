@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: amtrak-map-service
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 180
+    disk:
+      name: amtrak-cache
+      mountPath: /opt/render/project/src/cache
+      sizeGB: 1
+    envVars:
+      - key: CACHE_DIR
+        value: /opt/render/project/src/cache
+      - key: GTFS_CACHE_MAX_AGE_HOURS
+        value: "24"
+
+
+cd ~/Documents/Amtrak_Route_Planner/amtrak-map-service
+
+git init
+git add .
+git commit -m "Initial map service for Render"
+
+git remote add origin https://github.com/tb-125/amtrak-map-service.git
+git branch -M main
+git push -u origin main
