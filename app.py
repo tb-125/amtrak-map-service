@@ -28,8 +28,8 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# Lightweight US states outline GeoJSON (public domain-ish dataset mirrors exist; this one is stable)
-US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/us-states.json"
+# More reliable CDN mirror than GitHub raw
+US_STATES_GEOJSON_URL = "https://cdn.jsdelivr.net/gh/PublicaMundi/MappingAPI@master/data/us-states.json"
 
 LONG_DISTANCE_NAMES = [
     "Auto Train",
@@ -87,7 +87,7 @@ def _download_bytes_cached(url: str, cache: dict, key_bytes: str, key_time: str,
         age = (now - cache[key_time]).total_seconds() / 60.0
         if age <= max_age_minutes:
             return cache[key_bytes]
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=60, headers={"User-Agent": "amtrak-map-service/1.0"})
     r.raise_for_status()
     cache[key_bytes] = r.content
     cache[key_time] = now
@@ -99,17 +99,30 @@ def _download_gtfs_zip_bytes(max_age_minutes: int = 60) -> bytes:
 
 
 def _download_states_geojson(max_age_minutes: int = 1440):
+    """
+    Download a US states GeoJSON basemap. If the download fails, return an empty FeatureCollection
+    so the map still renders (just without the basemap).
+    """
     now = datetime.utcnow()
     if _STATES_CACHE["geojson"] is not None and _STATES_CACHE["fetched_at"] is not None:
         age = (now - _STATES_CACHE["fetched_at"]).total_seconds() / 60.0
         if age <= max_age_minutes:
             return _STATES_CACHE["geojson"]
 
-    r = requests.get(US_STATES_GEOJSON_URL, timeout=60)
-    r.raise_for_status()
-    _STATES_CACHE["geojson"] = r.json()
-    _STATES_CACHE["fetched_at"] = now
-    return _STATES_CACHE["geojson"]
+    try:
+        r = requests.get(
+            US_STATES_GEOJSON_URL,
+            timeout=60,
+            headers={"User-Agent": "amtrak-map-service/1.0"},
+        )
+        r.raise_for_status()
+        _STATES_CACHE["geojson"] = r.json()
+        _STATES_CACHE["fetched_at"] = now
+        return _STATES_CACHE["geojson"]
+    except Exception as e:
+        # Don't hard-fail the whole map if basemap fetch fails.
+        print(f"[WARN] Failed to download states basemap: {e}")
+        return {"type": "FeatureCollection", "features": []}
 
 
 def _read_txt(z: zipfile.ZipFile, name: str) -> pd.DataFrame:
@@ -178,7 +191,7 @@ def _draw_direction_arrow(ax, x0, y0, x1, y1, colour, is_day: bool):
 
 def _draw_states_basemap(ax):
     """
-    Draw US states outlines from GeoJSON. Light outline only (no fill).
+    Draw US state outlines from GeoJSON. Light outline only (no fill).
     """
     gj = _download_states_geojson()
     feats = gj.get("features", [])
@@ -188,17 +201,14 @@ def _draw_states_basemap(ax):
         coords = geom.get("coordinates", [])
 
         def draw_ring(ring):
-            # ring: [[lon,lat], [lon,lat], ...]
             xs = [pt[0] for pt in ring]
             ys = [pt[1] for pt in ring]
-            ax.plot(xs, ys, linewidth=0.6, alpha=0.35, zorder=1)
+            ax.plot(xs, ys, linewidth=0.6, alpha=0.35, zorder=1, color="black")
 
         if gtype == "Polygon":
-            # coords: [ring1, ring2...]
             for ring in coords:
                 draw_ring(ring)
         elif gtype == "MultiPolygon":
-            # coords: [[poly1_rings], [poly2_rings], ...]
             for poly in coords:
                 for ring in poly:
                     draw_ring(ring)
@@ -262,13 +272,12 @@ def _make_combined_figure(run_date: date):
         fontsize=14
     )
 
-    # USA-ish viewport
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    # Basemap: state outlines
+    # Basemap: state outlines (fails gracefully if fetch fails)
     _draw_states_basemap(ax)
 
     # Legends
@@ -299,7 +308,6 @@ def _make_combined_figure(run_date: date):
         if len(st) < 2:
             continue
 
-        # segments
         for i in range(len(st) - 1):
             a = st.iloc[i]
             b = st.iloc[i + 1]
@@ -335,7 +343,6 @@ def _make_combined_figure(run_date: date):
                 zorder=5,
             )
 
-            # subtle direction cue
             if i % ARROW_EVERY_N_SEGMENTS == 0:
                 xm0 = x0 + (x1 - x0) * 0.47
                 ym0 = y0 + (y1 - y0) * 0.47
@@ -370,7 +377,6 @@ def _make_combined_figure(run_date: date):
 
     ax.grid(True, linewidth=0.3, alpha=0.25)
 
-    # make room for legend on right
     fig.tight_layout(rect=[0, 0, 0.80, 1])
     return fig
 
