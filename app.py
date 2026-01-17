@@ -28,6 +28,9 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
+# Lightweight US states outline GeoJSON (public domain-ish dataset mirrors exist; this one is stable)
+US_STATES_GEOJSON_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/us-states.json"
+
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -45,45 +48,26 @@ LONG_DISTANCE_NAMES = [
     "Floridian",
 ]
 
-DIRECTION_LABELS = {
-    0: "Westbound / Southbound",
-    1: "Eastbound / Northbound",
-}
-
-KEY_CITIES = [
-    ("Seattle", -122.3321, 47.6062),
-    ("Portland", -122.6765, 45.5231),
-    ("San Francisco", -122.4194, 37.7749),
-    ("Los Angeles", -118.2437, 34.0522),
-    ("San Diego", -117.1611, 32.7157),
-    ("Denver", -104.9903, 39.7392),
-    ("Chicago", -87.6298, 41.8781),
-    ("St Louis", -90.1994, 38.6270),
-    ("New Orleans", -90.0715, 29.9511),
-    ("Atlanta", -84.3880, 33.7490),
-    ("Washington, DC", -77.0369, 38.9072),
-    ("New York", -74.0060, 40.7128),
-    ("Boston", -71.0589, 42.3601),
-]
-
 # ---- Styling ----
 DAY_LINEWIDTH = 2.6
 NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
+# subtle direction arrows
 ARROW_EVERY_N_SEGMENTS = 14
-ARROW_HEAD_LENGTH = 3.5
-ARROW_HEAD_WIDTH = 2.4
-ARROW_LW_DAY = 0.45
-ARROW_LW_NIGHT = 0.35
-ARROW_ALPHA_DAY = 0.5
-ARROW_ALPHA_NIGHT = 0.3
+ARROW_HEAD_LENGTH = 3.2
+ARROW_HEAD_WIDTH = 2.2
+ARROW_LW_DAY = 0.38
+ARROW_LW_NIGHT = 0.30
+ARROW_ALPHA_DAY = 0.45
+ARROW_ALPHA_NIGHT = 0.28
 
+# labels
 ROUTE_LABEL_FONTSIZE = 6.5
 LABEL_OFFSET_DEGREES = 0.35
 LABEL_HALO_WIDTH = 2.2
 
-# Fixed, print-safe colours
+# fixed, print-safe colours
 HEX_PALETTE = [
     "#1b9e77", "#d95f02", "#7570b3", "#e7298a",
     "#66a61e", "#e6ab02", "#a6761d", "#666666",
@@ -92,22 +76,40 @@ HEX_PALETTE = [
 ]
 ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
 
-# --- In-memory cache for GTFS ---
+# --- caches ---
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
+_STATES_CACHE = {"fetched_at": None, "geojson": None}
+
+
+def _download_bytes_cached(url: str, cache: dict, key_bytes: str, key_time: str, max_age_minutes: int = 1440) -> bytes:
+    now = datetime.utcnow()
+    if cache.get(key_bytes) is not None and cache.get(key_time) is not None:
+        age = (now - cache[key_time]).total_seconds() / 60.0
+        if age <= max_age_minutes:
+            return cache[key_bytes]
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    cache[key_bytes] = r.content
+    cache[key_time] = now
+    return r.content
 
 
 def _download_gtfs_zip_bytes(max_age_minutes: int = 60) -> bytes:
-    now = datetime.utcnow()
-    if _GTFS_CACHE["zip_bytes"] is not None and _GTFS_CACHE["fetched_at"] is not None:
-        age = (now - _GTFS_CACHE["fetched_at"]).total_seconds() / 60.0
-        if age <= max_age_minutes:
-            return _GTFS_CACHE["zip_bytes"]
+    return _download_bytes_cached(GTFS_URL, _GTFS_CACHE, "zip_bytes", "fetched_at", max_age_minutes)
 
-    r = requests.get(GTFS_URL, timeout=60)
+
+def _download_states_geojson(max_age_minutes: int = 1440):
+    now = datetime.utcnow()
+    if _STATES_CACHE["geojson"] is not None and _STATES_CACHE["fetched_at"] is not None:
+        age = (now - _STATES_CACHE["fetched_at"]).total_seconds() / 60.0
+        if age <= max_age_minutes:
+            return _STATES_CACHE["geojson"]
+
+    r = requests.get(US_STATES_GEOJSON_URL, timeout=60)
     r.raise_for_status()
-    _GTFS_CACHE["zip_bytes"] = r.content
-    _GTFS_CACHE["fetched_at"] = now
-    return r.content
+    _STATES_CACHE["geojson"] = r.json()
+    _STATES_CACHE["fetched_at"] = now
+    return _STATES_CACHE["geojson"]
 
 
 def _read_txt(z: zipfile.ZipFile, name: str) -> pd.DataFrame:
@@ -145,10 +147,15 @@ def _is_daylight(lat: float, lon: float, tz_name: str, dt_local) -> bool:
     return s["sunrise"] <= dt_local <= s["sunset"]
 
 
-def _draw_background(ax):
-    for nm, lon, lat in KEY_CITIES:
-        ax.scatter(lon, lat, s=10, color="0.70", zorder=2)
-        ax.text(lon + 0.25, lat + 0.15, nm, fontsize=7, color="0.50", zorder=2)
+def _perpendicular_offset(x0, y0, x1, y1, distance):
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return 0.0, 0.0
+    ux = -dy / length
+    uy = dx / length
+    return ux * distance, uy * distance
 
 
 def _draw_direction_arrow(ax, x0, y0, x1, y1, colour, is_day: bool):
@@ -169,19 +176,39 @@ def _draw_direction_arrow(ax, x0, y0, x1, y1, colour, is_day: bool):
     )
 
 
-def _perpendicular_offset(x0, y0, x1, y1, distance):
-    dx = x1 - x0
-    dy = y1 - y0
-    length = math.hypot(dx, dy)
-    if length == 0:
-        return 0.0, 0.0
-    ux = -dy / length
-    uy = dx / length
-    return ux * distance, uy * distance
+def _draw_states_basemap(ax):
+    """
+    Draw US states outlines from GeoJSON. Light outline only (no fill).
+    """
+    gj = _download_states_geojson()
+    feats = gj.get("features", [])
+    for feat in feats:
+        geom = feat.get("geometry", {})
+        gtype = geom.get("type")
+        coords = geom.get("coordinates", [])
+
+        def draw_ring(ring):
+            # ring: [[lon,lat], [lon,lat], ...]
+            xs = [pt[0] for pt in ring]
+            ys = [pt[1] for pt in ring]
+            ax.plot(xs, ys, linewidth=0.6, alpha=0.35, zorder=1)
+
+        if gtype == "Polygon":
+            # coords: [ring1, ring2...]
+            for ring in coords:
+                draw_ring(ring)
+        elif gtype == "MultiPolygon":
+            # coords: [[poly1_rings], [poly2_rings], ...]
+            for poly in coords:
+                for ring in poly:
+                    draw_ring(ring)
 
 
 def _load_representative_trips(run_date: date):
-    """Load GTFS, filter services active on run_date, and pick a representative trip per (route, direction)."""
+    """
+    Load GTFS; filter services active on run_date; choose a representative trip per (route, direction)
+    by selecting the trip with the most stops.
+    """
     zip_bytes = _download_gtfs_zip_bytes()
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
 
@@ -192,6 +219,7 @@ def _load_representative_trips(run_date: date):
     calendar = _read_txt(z, "calendar.txt")
 
     yyyymmdd = run_date.strftime("%Y%m%d")
+
     active_services = {
         row["service_id"]
         for _, row in calendar.iterrows()
@@ -222,33 +250,35 @@ def _load_representative_trips(run_date: date):
     return reps, stop_times, stops
 
 
-def _make_figure_for_direction(run_date: date, direction: int):
-    """Build a Matplotlib figure for a given direction and return the Figure."""
+def _make_combined_figure(run_date: date):
+    """
+    ONE map: draw both directions on the same figure.
+    """
     reps, stop_times, stops = _load_representative_trips(run_date)
 
-    legend_handles = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
-    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
-
     fig, ax = plt.subplots(figsize=(16, 9))
-
     ax.set_title(
-        f"Amtrak Long-Distance Routes — {DIRECTION_LABELS.get(direction, direction)}\n"
-        f"Daylight vs Darkness — {run_date}",
-        fontsize=14,
+        f"Amtrak Long-Distance Routes — Both Directions\nDaylight vs Darkness — {run_date}",
+        fontsize=14
     )
 
+    # USA-ish viewport
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
 
-    _draw_background(ax)
+    # Basemap: state outlines
+    _draw_states_basemap(ax)
+
+    # Legends
+    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
+    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
+    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
 
     ax.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
-
     key = ax.legend(
-        handles=legend_handles,
+        handles=legend_routes,
         loc="upper left",
         bbox_to_anchor=(1.02, 1.00),
         borderaxespad=0.0,
@@ -260,10 +290,8 @@ def _make_figure_for_direction(run_date: date, direction: int):
     )
     ax.add_artist(key)
 
+    # Draw BOTH directions (overlay)
     for name, dir_id, trip_id in reps:
-        if dir_id != direction:
-            continue
-
         colour = ROUTE_COLOURS.get(name, "#000000")
 
         st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
@@ -271,6 +299,7 @@ def _make_figure_for_direction(run_date: date, direction: int):
         if len(st) < 2:
             continue
 
+        # segments
         for i in range(len(st) - 1):
             a = st.iloc[i]
             b = st.iloc[i + 1]
@@ -306,6 +335,7 @@ def _make_figure_for_direction(run_date: date, direction: int):
                 zorder=5,
             )
 
+            # subtle direction cue
             if i % ARROW_EVERY_N_SEGMENTS == 0:
                 xm0 = x0 + (x1 - x0) * 0.47
                 ym0 = y0 + (y1 - y0) * 0.47
@@ -313,11 +343,10 @@ def _make_figure_for_direction(run_date: date, direction: int):
                 ym1 = y0 + (y1 - y0) * 0.53
                 _draw_direction_arrow(ax, xm0, ym0, xm1, ym1, colour, daylight)
 
-        # label near midpoint, offset perpendicular
+        # label off the line
         mid = len(st) // 2
         a = st.iloc[mid - 1]
         b = st.iloc[mid]
-
         x_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
         y_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
         dx, dy = _perpendicular_offset(
@@ -339,40 +368,35 @@ def _make_figure_for_direction(run_date: date, direction: int):
             path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
         )
 
-    ax.grid(True, linewidth=0.3, alpha=0.4)
+    ax.grid(True, linewidth=0.3, alpha=0.25)
 
-    # Make room on right for external legend
+    # make room for legend on right
     fig.tight_layout(rect=[0, 0, 0.80, 1])
-
     return fig
 
 
-def build_pdf_bytes(run_date: date) -> bytes:
-    out = io.BytesIO()
-    with PdfPages(out) as pdf:
-        for direction in [0, 1]:
-            fig = _make_figure_for_direction(run_date, direction)
-            pdf.savefig(fig)
-            plt.close(fig)
-    out.seek(0)
-    return out.getvalue()
-
-
-def build_png_bytes(run_date: date, direction: int) -> bytes:
-    fig = _make_figure_for_direction(run_date, direction)
+def build_png_bytes(run_date: date) -> bytes:
+    fig = _make_combined_figure(run_date)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=170)  # dpi tuned for web
+    fig.savefig(buf, format="png", dpi=170)
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
 
+def build_pdf_bytes(run_date: date) -> bytes:
+    out = io.BytesIO()
+    with PdfPages(out) as pdf:
+        fig = _make_combined_figure(run_date)
+        pdf.savefig(fig)
+        plt.close(fig)
+    out.seek(0)
+    return out.getvalue()
+
+
 @app.get("/")
 def index():
-    # Default date (your target) unless query overrides
     d = request.args.get("date", "2026-02-06").strip()
-
-    # Simple HTML that shows images immediately + lets you change date
     html = f"""
     <!doctype html>
     <html>
@@ -382,10 +406,9 @@ def index():
       <title>Amtrak Daylight Map</title>
       <style>
         body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; }}
-        .row {{ display: grid; grid-template-columns: 1fr; gap: 14px; }}
+        .top {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }}
         .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 12px; }}
         img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
-        .top {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }}
         input {{ padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; }}
         a {{ color: #0b57d0; text-decoration: none; }}
         a:hover {{ text-decoration: underline; }}
@@ -399,18 +422,11 @@ def index():
           <input name="date" value="{d}" />
           <button type="submit">Update</button>
         </form>
-        <span>Optional PDF: <a href="/map.pdf?date={d}">download/print</a></span>
+        <span>PDF: <a href="/map.pdf?date={d}">print/download</a></span>
       </div>
 
-      <div class="row">
-        <div class="card">
-          <h3 style="margin-top:0;">{DIRECTION_LABELS[0]}</h3>
-          <img src="/map.png?date={d}&dir=0" alt="Map direction 0">
-        </div>
-        <div class="card">
-          <h3 style="margin-top:0;">{DIRECTION_LABELS[1]}</h3>
-          <img src="/map.png?date={d}&dir=1" alt="Map direction 1">
-        </div>
+      <div class="card">
+        <img src="/map.png?date={d}" alt="Amtrak map">
       </div>
     </body>
     </html>
@@ -421,8 +437,6 @@ def index():
 @app.get("/map.png")
 def map_png():
     d = request.args.get("date", "").strip()
-    dir_str = request.args.get("dir", "").strip()
-
     if not d:
         abort(400, "Missing required query parameter: date=YYYY-MM-DD")
     try:
@@ -431,15 +445,7 @@ def map_png():
         abort(400, "Invalid date format. Use YYYY-MM-DD (e.g. 2026-02-06).")
 
     try:
-        direction = int(dir_str)
-    except Exception:
-        abort(400, "Missing or invalid dir. Use dir=0 or dir=1")
-
-    if direction not in (0, 1):
-        abort(400, "dir must be 0 or 1")
-
-    try:
-        png_bytes = build_png_bytes(run_date, direction)
+        png_bytes = build_png_bytes(run_date)
     except Exception as e:
         abort(500, f"Failed to generate PNG: {e}")
 
