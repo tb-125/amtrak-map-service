@@ -9,7 +9,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
 os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import matplotlib
-matplotlib.use("Agg")  # non-GUI backend for servers
+matplotlib.use("Agg")  # server-safe backend
 
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
@@ -27,8 +27,6 @@ from flask import Flask, Response, request, abort
 app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
-
-# More reliable CDN mirror than GitHub raw
 US_STATES_GEOJSON_URL = "https://cdn.jsdelivr.net/gh/PublicaMundi/MappingAPI@master/data/us-states.json"
 
 LONG_DISTANCE_NAMES = [
@@ -48,26 +46,32 @@ LONG_DISTANCE_NAMES = [
     "Floridian",
 ]
 
-# ---- Styling ----
+DIRECTION_LABELS = {
+    0: "Westbound / Southbound",
+    1: "Eastbound / Northbound",
+}
+
+# ---- Line styling (day/night) ----
 DAY_LINEWIDTH = 2.6
 NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
-# subtle direction arrows
-ARROW_EVERY_N_SEGMENTS = 14
-ARROW_HEAD_LENGTH = 3.2
-ARROW_HEAD_WIDTH = 2.2
-ARROW_LW_DAY = 0.38
-ARROW_LW_NIGHT = 0.30
-ARROW_ALPHA_DAY = 0.45
-ARROW_ALPHA_NIGHT = 0.28
-
-# labels
+# ---- Labels ----
 ROUTE_LABEL_FONTSIZE = 6.5
 LABEL_OFFSET_DEGREES = 0.35
 LABEL_HALO_WIDTH = 2.2
 
-# fixed, print-safe colours
+# ---- Chevrons (unfilled) ----
+CHEVRON_EVERY_N_SEGMENTS = 18
+CHEVRON_SKIP_END_SEGMENTS = 6
+CHEVRON_SIZE_DEG = 0.10       # smaller = tinier
+CHEVRON_ANGLE_DEG = 24
+CHEVRON_LW_DAY = 0.35
+CHEVRON_LW_NIGHT = 0.28
+CHEVRON_ALPHA_DAY = 0.55
+CHEVRON_ALPHA_NIGHT = 0.35
+
+# ---- Fixed, print-safe colours ----
 HEX_PALETTE = [
     "#1b9e77", "#d95f02", "#7570b3", "#e7298a",
     "#66a61e", "#e6ab02", "#a6761d", "#666666",
@@ -99,10 +103,6 @@ def _download_gtfs_zip_bytes(max_age_minutes: int = 60) -> bytes:
 
 
 def _download_states_geojson(max_age_minutes: int = 1440):
-    """
-    Download a US states GeoJSON basemap. If the download fails, return an empty FeatureCollection
-    so the map still renders (just without the basemap).
-    """
     now = datetime.utcnow()
     if _STATES_CACHE["geojson"] is not None and _STATES_CACHE["fetched_at"] is not None:
         age = (now - _STATES_CACHE["fetched_at"]).total_seconds() / 60.0
@@ -120,7 +120,6 @@ def _download_states_geojson(max_age_minutes: int = 1440):
         _STATES_CACHE["fetched_at"] = now
         return _STATES_CACHE["geojson"]
     except Exception as e:
-        # Don't hard-fail the whole map if basemap fetch fails.
         print(f"[WARN] Failed to download states basemap: {e}")
         return {"type": "FeatureCollection", "features": []}
 
@@ -171,28 +170,7 @@ def _perpendicular_offset(x0, y0, x1, y1, distance):
     return ux * distance, uy * distance
 
 
-def _draw_direction_arrow(ax, x0, y0, x1, y1, colour, is_day: bool):
-    ax.annotate(
-        "",
-        xy=(x1, y1),
-        xytext=(x0, y0),
-        arrowprops=dict(
-            arrowstyle=f"-|>,head_length={ARROW_HEAD_LENGTH},head_width={ARROW_HEAD_WIDTH}",
-            color=colour,
-            lw=ARROW_LW_DAY if is_day else ARROW_LW_NIGHT,
-            linestyle="-" if is_day else "--",
-            alpha=ARROW_ALPHA_DAY if is_day else ARROW_ALPHA_NIGHT,
-            shrinkA=0,
-            shrinkB=0,
-        ),
-        zorder=6,
-    )
-
-
 def _draw_states_basemap(ax):
-    """
-    Draw US state outlines from GeoJSON. Light outline only (no fill).
-    """
     gj = _download_states_geojson()
     feats = gj.get("features", [])
     for feat in feats:
@@ -203,7 +181,7 @@ def _draw_states_basemap(ax):
         def draw_ring(ring):
             xs = [pt[0] for pt in ring]
             ys = [pt[1] for pt in ring]
-            ax.plot(xs, ys, linewidth=0.6, alpha=0.35, zorder=1, color="black")
+            ax.plot(xs, ys, linewidth=0.6, alpha=0.30, zorder=1, color="black")
 
         if gtype == "Polygon":
             for ring in coords:
@@ -214,10 +192,35 @@ def _draw_states_basemap(ax):
                     draw_ring(ring)
 
 
+def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
+    """
+    Draw a tiny unfilled chevron centered at (x,y), pointing along heading_rad.
+    """
+    lw = CHEVRON_LW_DAY if is_day else CHEVRON_LW_NIGHT
+    alpha = CHEVRON_ALPHA_DAY if is_day else CHEVRON_ALPHA_NIGHT
+
+    a = math.radians(CHEVRON_ANGLE_DEG)
+    s = CHEVRON_SIZE_DEG
+
+    # tip forward, two tails behind at +/- angle
+    tip_x = x + math.cos(heading_rad) * (s * 0.35)
+    tip_y = y + math.sin(heading_rad) * (s * 0.35)
+
+    left_dir = heading_rad + math.pi - a
+    right_dir = heading_rad + math.pi + a
+
+    left_x = tip_x + math.cos(left_dir) * (s * 0.85)
+    left_y = tip_y + math.sin(left_dir) * (s * 0.85)
+    right_x = tip_x + math.cos(right_dir) * (s * 0.85)
+    right_y = tip_y + math.sin(right_dir) * (s * 0.85)
+
+    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=6)
+    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=6)
+
+
 def _load_representative_trips(run_date: date):
     """
-    Load GTFS; filter services active on run_date; choose a representative trip per (route, direction)
-    by selecting the trip with the most stops.
+    Pick one representative trip per (route, direction) = the trip with most stops.
     """
     zip_bytes = _download_gtfs_zip_bytes()
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -260,47 +263,21 @@ def _load_representative_trips(run_date: date):
     return reps, stop_times, stops
 
 
-def _make_combined_figure(run_date: date):
-    """
-    ONE map: draw both directions on the same figure.
-    """
-    reps, stop_times, stops = _load_representative_trips(run_date)
-
-    fig, ax = plt.subplots(figsize=(16, 9))
-    ax.set_title(
-        f"Amtrak Long-Distance Routes — Both Directions\nDaylight vs Darkness — {run_date}",
-        fontsize=14
-    )
-
+def _setup_axes(ax, panel_title: str):
+    ax.set_title(panel_title, fontsize=12)
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-
-    # Basemap: state outlines (fails gracefully if fetch fails)
     _draw_states_basemap(ax)
+    ax.grid(True, linewidth=0.3, alpha=0.20)
 
-    # Legends
-    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
-    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
 
-    ax.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
-    key = ax.legend(
-        handles=legend_routes,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.00),
-        borderaxespad=0.0,
-        fontsize=8,
-        frameon=False,
-        title="Train services",
-        title_fontsize=9,
-        ncol=1,
-    )
-    ax.add_artist(key)
-
-    # Draw BOTH directions (overlay)
+def _draw_direction_on_ax(ax, run_date: date, direction: int, reps, stop_times, stops):
     for name, dir_id, trip_id in reps:
+        if dir_id != direction:
+            continue
+
         colour = ROUTE_COLOURS.get(name, "#000000")
 
         st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
@@ -308,7 +285,9 @@ def _make_combined_figure(run_date: date):
         if len(st) < 2:
             continue
 
-        for i in range(len(st) - 1):
+        nseg = len(st) - 1
+
+        for i in range(nseg):
             a = st.iloc[i]
             b = st.iloc[i + 1]
 
@@ -343,19 +322,22 @@ def _make_combined_figure(run_date: date):
                 zorder=5,
             )
 
-            if i % ARROW_EVERY_N_SEGMENTS == 0:
-                xm0 = x0 + (x1 - x0) * 0.47
-                ym0 = y0 + (y1 - y0) * 0.47
-                xm1 = x0 + (x1 - x0) * 0.53
-                ym1 = y0 + (y1 - y0) * 0.53
-                _draw_direction_arrow(ax, xm0, ym0, xm1, ym1, colour, daylight)
+            # chevrons (skip near route ends)
+            near_start = i < CHEVRON_SKIP_END_SEGMENTS
+            near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
+            if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
+                xc = x0 + (x1 - x0) * 0.50
+                yc = y0 + (y1 - y0) * 0.50
+                heading = math.atan2((y1 - y0), (x1 - x0))
+                _draw_chevron(ax, xc, yc, heading, colour, daylight)
 
-        # label off the line
+        # label near midpoint, offset perpendicular to avoid overlap
         mid = len(st) // 2
         a = st.iloc[mid - 1]
         b = st.iloc[mid]
         x_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
         y_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
+
         dx, dy = _perpendicular_offset(
             float(a["stop_lon"]), float(a["stop_lat"]),
             float(b["stop_lon"]), float(b["stop_lat"]),
@@ -375,14 +357,46 @@ def _make_combined_figure(run_date: date):
             path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
         )
 
-    ax.grid(True, linewidth=0.3, alpha=0.25)
 
-    fig.tight_layout(rect=[0, 0, 0.80, 1])
+def _make_side_by_side_figure(run_date: date):
+    reps, stop_times, stops = _load_representative_trips(run_date)
+
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(20, 9))
+    fig.suptitle(f"Amtrak Long-Distance Routes — Daylight vs Darkness — {run_date}", fontsize=14)
+
+    _setup_axes(ax_left, DIRECTION_LABELS[0])
+    _setup_axes(ax_right, DIRECTION_LABELS[1])
+
+    _draw_direction_on_ax(ax_left, run_date, 0, reps, stop_times, stops)
+    _draw_direction_on_ax(ax_right, run_date, 1, reps, stop_times, stops)
+
+    # Legends (one shared legend on the right side)
+    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
+    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
+    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
+
+    # day/night legend under left panel
+    ax_left.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
+
+    # route key to the far right of the whole figure
+    fig.legend(
+        handles=legend_routes,
+        loc="upper left",
+        bbox_to_anchor=(0.86, 0.92),
+        fontsize=8,
+        frameon=False,
+        title="Train services",
+        title_fontsize=9,
+        ncol=1,
+    )
+
+    # make room for the legend area on the right
+    fig.tight_layout(rect=[0.0, 0.0, 0.85, 0.93])
     return fig
 
 
 def build_png_bytes(run_date: date) -> bytes:
-    fig = _make_combined_figure(run_date)
+    fig = _make_side_by_side_figure(run_date)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=170)
     plt.close(fig)
@@ -393,7 +407,7 @@ def build_png_bytes(run_date: date) -> bytes:
 def build_pdf_bytes(run_date: date) -> bytes:
     out = io.BytesIO()
     with PdfPages(out) as pdf:
-        fig = _make_combined_figure(run_date)
+        fig = _make_side_by_side_figure(run_date)
         pdf.savefig(fig)
         plt.close(fig)
     out.seek(0)
