@@ -729,7 +729,7 @@ def index():
         <h2 style="margin:0;">Amtrak Daylight Map</h2>
         <form method="get" action="/" style="margin:0;">
           <label>Date (YYYY-MM-DD): </label>
-          <input name="date" value="{d}" />
+          <input type="date" name="date" value="{d}" min="2025-01-01" max="2027-12-31" />
           <button type="submit">Update</button>
         </form>
       </div>
