@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# Order matters: Texas Eagle before Sunset Limited so Texas Eagle is "primary" for merging
+# Sunset Limited removed to avoid confusion
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -41,7 +41,6 @@ LONG_DISTANCE_NAMES = [
     "Lake Shore Limited",
     "Southwest Chief",
     "Texas Eagle",
-    "Sunset Limited",
     "Silver Meteor",
     "Palmetto",
     "Floridian",
@@ -59,43 +58,59 @@ PARALLEL_GAP_DEG = 0.17
 STATION_FONTSIZE = 7.0
 STATION_HALO_WIDTH = 2.6
 
-# Curated station trigraphs with approximate coordinates (kept sparse to avoid clutter)
+# Curated station trigraphs + approximate coordinates.
+# Includes extra "interim" points on main east-west routes (Zephyr / Chief / Builder / LSL).
 STATION_MARKERS = [
+    # West Coast / California
     ("SEA", -122.3301, 47.6038),
     ("PDX", -122.6765, 45.5231),
+    ("SPK", -117.4260, 47.6588),
     ("SAC", -121.4944, 38.5816),
+    ("RNO", -119.8138, 39.5296),
     ("EMY", -122.2920, 37.8400),
     ("SJC", -121.9010, 37.3290),
     ("LAX", -118.2437, 34.0522),
     ("SAN", -117.1611, 32.7157),
 
+    # Rockies / Southwest
+    ("GJT", -108.5506, 39.0639),   # Grand Junction-ish
     ("DEN", -104.9903, 39.7392),
     ("SLC", -111.8910, 40.7608),
     ("ABQ", -106.6504, 35.0844),
 
+    # Plains / Midwest (east-west corridors)
+    ("KCY", -94.5786, 39.0997),    # Kansas City-ish
+    ("OMA", -95.9345, 41.2565),    # Omaha-ish (useful reference even if not on every route)
+    ("MSP", -93.2650, 44.9778),
+    ("FAR", -96.7898, 46.8772),    # Fargo-ish
+
+    # Glacier / Northern corridor
+    ("GPK", -113.9980, 48.4210),   # West Glacier / Glacier Park-ish
+
+    # Great Lakes / Northeast
     ("CHI", -87.6300, 41.8819),
     ("STL", -90.1994, 38.6270),
-    ("MSP", -93.2650, 44.9778),
-
-    ("NOL", -90.0715, 29.9511),
-    ("ATL", -84.3880, 33.7490),
-
-    ("WAS", -77.0067, 38.8977),
-    ("PHL", -75.1652, 39.9526),
+    ("CLE", -81.6944, 41.4993),
+    ("BUF", -78.8784, 42.8864),
+    ("ALB", -73.7562, 42.6526),
     ("NYP", -73.9940, 40.7527),
     ("BOS", -71.0589, 42.3601),
+    ("PHL", -75.1652, 39.9526),
+    ("WAS", -77.0067, 38.8977),
+
+    # South / East
+    ("NOL", -90.0715, 29.9511),
+    ("ATL", -84.3880, 33.7490),
     ("MIA", -80.1918, 25.7617),
 ]
 
-# ---- Chevrons ----
+# ---- Chevrons (night-only) ----
 CHEVRON_EVERY_N_SEGMENTS = 10
 CHEVRON_SKIP_END_SEGMENTS = 3
 CHEVRON_SIZE_DEG = 0.36
 CHEVRON_ANGLE_DEG = 24
-CHEVRON_LW_DAY = 1.05
-CHEVRON_LW_NIGHT = 0.90
-CHEVRON_ALPHA_DAY = 0.95
-CHEVRON_ALPHA_NIGHT = 0.75
+CHEVRON_LW_NIGHT = 1.05
+CHEVRON_ALPHA_NIGHT = 0.90
 CHEVRON_ZORDER = 10
 
 # ---- Fixed colours ----
@@ -108,25 +123,6 @@ HEX_PALETTE = [
 ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
 
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
-
-# ---- Merge daylight for routes that share track ----
-# Direction-aware merge so eastbound and westbound remain different.
-MERGE_DAYLIGHT_GROUPS = [
-    {"Texas Eagle", "Sunset Limited"},
-]
-# cache: group -> { direction_id -> { (gx,gy) : daylight_bool } }
-_MERGE_DAYLIGHT_CACHE = {frozenset(g): {0: {}, 1: {}} for g in MERGE_DAYLIGHT_GROUPS}
-
-# Coarse grid for geographic merging
-MERGE_GRID_DEG = 0.25
-MERGE_NEIGHBOR_RADIUS = 1
-
-
-def _merge_group_for(route_name: str):
-    for g in MERGE_DAYLIGHT_GROUPS:
-        if route_name in g:
-            return frozenset(g)
-    return None
 
 
 def _download_bytes_cached(url: str, cache: dict, key_bytes: str, key_time: str, max_age_minutes: int = 1440) -> bytes:
@@ -212,10 +208,7 @@ def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
     return outx, outy
 
 
-def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
-    lw = CHEVRON_LW_DAY if is_day else CHEVRON_LW_NIGHT
-    alpha = CHEVRON_ALPHA_DAY if is_day else CHEVRON_ALPHA_NIGHT
-
+def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
     a = math.radians(CHEVRON_ANGLE_DEG)
     s = CHEVRON_SIZE_DEG
 
@@ -230,12 +223,17 @@ def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
     right_x = tip_x + math.cos(right_dir) * (s * 0.85)
     right_y = tip_y + math.sin(right_dir) * (s * 0.85)
 
-    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
-    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
+    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
+    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
 
 
 def _draw_station_labels(ax):
+    # De-duplicate by code (in case you add extras later)
+    seen = set()
     for code, lon, lat in STATION_MARKERS:
+        if code in seen:
+            continue
+        seen.add(code)
         ax.text(
             lon, lat, code,
             fontsize=STATION_FONTSIZE,
@@ -344,10 +342,6 @@ def _load_trips_and_stops(run_date: date):
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
 
-    # reset merge cache per request
-    for g in list(_MERGE_DAYLIGHT_CACHE.keys()):
-        _MERGE_DAYLIGHT_CACHE[g] = {0: {}, 1: {}}
-
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
         f"Amtrak Long-Distance Routes\nDaylight vs Darkness — {run_date}",
@@ -355,6 +349,8 @@ def _make_map(run_date: date):
     )
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.grid(True, linewidth=0.3, alpha=0.20)
@@ -367,7 +363,7 @@ def _make_map(run_date: date):
     style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=True)
     ax.add_artist(style_leg)
 
-    # Route colour key INSIDE bottom right
+    # Route colour key inside bottom right
     legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
     route_leg = ax.legend(
         handles=legend_routes,
@@ -386,7 +382,6 @@ def _make_map(run_date: date):
             continue
 
         colour = ROUTE_COLOURS.get(name, "#000000")
-        grp = _merge_group_for(name)
 
         # Draw each branch for the route (Empire Builder includes SEA + PDX branches if present)
         for _, dir_map in routes_branches[name].items():
@@ -461,27 +456,6 @@ def _make_map(run_date: date):
                     sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
                     daylight = sunrise <= dt_here <= sunset
 
-                    # Merge daylight where routes share track — direction-aware
-                    if grp is not None:
-                        cache_dir = _MERGE_DAYLIGHT_CACHE[grp][direction_id]
-                        gx = int(round(lon_mid / MERGE_GRID_DEG))
-                        gy = int(round(lat_mid / MERGE_GRID_DEG))
-
-                        found = None
-                        for dx in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
-                            for dy in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
-                                k = (gx + dx, gy + dy)
-                                if k in cache_dir:
-                                    found = cache_dir[k]
-                                    break
-                            if found is not None:
-                                break
-
-                        if found is not None:
-                            daylight = found
-                        else:
-                            cache_dir[(gx, gy)] = daylight
-
                     x0, y0 = xs[i], ys[i]
                     x1, y1 = xs[i + 1], ys[i + 1]
 
@@ -495,11 +469,13 @@ def _make_map(run_date: date):
                         zorder=5,
                     )
 
-                    near_start = i < CHEVRON_SKIP_END_SEGMENTS
-                    near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
-                    if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
-                        heading = math.atan2((y1 - y0), (x1 - x0))
-                        _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
+                    # Chevrons NIGHT ONLY (more visible) + keep away from ends
+                    if not daylight:
+                        near_start = i < CHEVRON_SKIP_END_SEGMENTS
+                        near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
+                        if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
+                            heading = math.atan2((y1 - y0), (x1 - x0))
+                            _draw_chevron_night_only(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour)
 
     fig.tight_layout()
     return fig
