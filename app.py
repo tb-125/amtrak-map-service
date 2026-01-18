@@ -3,6 +3,7 @@ import io
 import zipfile
 import math
 from datetime import datetime, timedelta, date
+from collections import defaultdict
 
 # --- Render-safe matplotlib setup (BEFORE importing pyplot) ---
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
@@ -85,10 +86,10 @@ STATION_MARKERS = [
     ("MIA", -80.1918, 25.7617),
 ]
 
-# ---- Chevrons (double size) ----
+# ---- Chevrons ----
 CHEVRON_EVERY_N_SEGMENTS = 10
 CHEVRON_SKIP_END_SEGMENTS = 3
-CHEVRON_SIZE_DEG = 0.36          # doubled
+CHEVRON_SIZE_DEG = 0.36
 CHEVRON_ANGLE_DEG = 24
 CHEVRON_LW_DAY = 1.05
 CHEVRON_LW_NIGHT = 0.90
@@ -106,6 +107,19 @@ HEX_PALETTE = [
 ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
 
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
+
+# ---- Merge daylight for routes that share track ----
+MERGE_DAYLIGHT_GROUPS = [
+    {"Sunset Limited", "Texas Eagle"},
+]
+_MERGE_DAYLIGHT_CACHE = {frozenset(g): {} for g in MERGE_DAYLIGHT_GROUPS}
+
+
+def _merge_group_for(route_name: str):
+    for g in MERGE_DAYLIGHT_GROUPS:
+        if route_name in g:
+            return frozenset(g)
+    return None
 
 
 def _download_bytes_cached(url: str, cache: dict, key_bytes: str, key_time: str, max_age_minutes: int = 1440) -> bytes:
@@ -213,7 +227,63 @@ def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
     ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
 
 
+def _draw_station_labels(ax):
+    for code, lon, lat in STATION_MARKERS:
+        ax.text(
+            lon, lat, code,
+            fontsize=STATION_FONTSIZE,
+            ha="center", va="center",
+            color="black",
+            zorder=20,
+            path_effects=[pe.withStroke(linewidth=STATION_HALO_WIDTH, foreground="white")],
+        )
+
+
+def _map_seg_index(i, nseg_geom, nseg_time):
+    if nseg_geom <= 1 or nseg_time <= 1:
+        return min(i, max(0, nseg_time - 1))
+    return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
+
+
+def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
+    first = st_time.iloc[0]
+    origin_tz = first["stop_timezone"]
+    origin_dep_sec = first["dep_sec"]
+    if origin_dep_sec is None or pd.isna(origin_dep_sec):
+        origin_dep_sec = first["arr_sec"]
+
+    try:
+        tz = pytz.timezone(origin_tz)
+    except Exception:
+        tz = pytz.UTC
+
+    origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
+    return origin_dt_local, int(origin_dep_sec)
+
+
+def _branch_key_for_trip(trip_id: str, stop_times: pd.DataFrame, stops: pd.DataFrame):
+    """
+    Identify a "branch" by the unordered pair of endpoint coordinates (rounded).
+    This lets us capture Empire Builder's SEA and PDX branches (and any other splits).
+    """
+    st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
+    st = st.dropna(subset=["stop_lat", "stop_lon"]).sort_values("stop_sequence")
+    if len(st) < 2:
+        return None
+    a = st.iloc[0]
+    b = st.iloc[-1]
+    p0 = (round(float(a["stop_lat"]), 1), round(float(a["stop_lon"]), 1))
+    p1 = (round(float(b["stop_lat"]), 1), round(float(b["stop_lon"]), 1))
+    return frozenset((p0, p1))
+
+
 def _load_trips_and_stops(run_date: date):
+    """
+    Returns:
+      routes_branches[name][branch_key][direction_id] = trip_id
+
+    This explicitly allows multiple branches per route (notably Empire Builder to Seattle and Portland).
+    """
     zip_bytes = _download_gtfs_zip_bytes()
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
 
@@ -242,54 +312,39 @@ def _load_trips_and_stops(run_date: date):
     stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
     stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
 
-    reps = {}
-    for (name, direction), grp in trips.groupby(["route_long_name", "direction_id"]):
-        counts = stop_times[stop_times["trip_id"].isin(grp["trip_id"])].groupby("trip_id").size()
-        if len(counts):
-            reps[(name, int(direction))] = counts.idxmax()
+    # Stop count per trip (used to choose a representative trip per branch+direction)
+    trip_stop_counts = stop_times.groupby("trip_id").size().to_dict()
 
-    if not reps:
+    # Build branches per route+direction by endpoints
+    candidates = defaultdict(list)  # (route_name, direction_id, branch_key) -> [trip_id...]
+    for _, r in trips.iterrows():
+        name = r["route_long_name"]
+        direction = int(r["direction_id"])
+        tid = r["trip_id"]
+        bk = _branch_key_for_trip(tid, stop_times, stops)
+        if bk is None:
+            continue
+        candidates[(name, direction, bk)].append(tid)
+
+    # Pick best trip per branch+direction. For Empire Builder, we keep BOTH branches if present.
+    routes_branches = defaultdict(lambda: defaultdict(dict))  # name -> branch_key -> {dir: trip_id}
+    for (name, direction, bk), tids in candidates.items():
+        # choose the trip with the most stops for that branch+direction
+        best = max(tids, key=lambda t: trip_stop_counts.get(t, 0))
+        routes_branches[name][bk][direction] = best
+
+    if not routes_branches:
         raise RuntimeError("No matching long-distance trips found for that date in the GTFS feed.")
 
-    return reps, stop_times, stops
-
-
-def _map_seg_index(i, nseg_geom, nseg_time):
-    if nseg_geom <= 1 or nseg_time <= 1:
-        return min(i, max(0, nseg_time - 1))
-    return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
-
-
-def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
-    first = st_time.iloc[0]
-    origin_tz = first["stop_timezone"]
-    origin_dep_sec = first["dep_sec"]
-    if origin_dep_sec is None or pd.isna(origin_dep_sec):
-        origin_dep_sec = first["arr_sec"]
-
-    try:
-        tz = pytz.timezone(origin_tz)
-    except Exception:
-        tz = pytz.UTC
-
-    origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
-    return origin_dt_local, int(origin_dep_sec)
-
-
-def _draw_station_labels(ax):
-    for code, lon, lat in STATION_MARKERS:
-        ax.text(
-            lon, lat, code,
-            fontsize=STATION_FONTSIZE,
-            ha="center", va="center",
-            color="black",
-            zorder=20,
-            path_effects=[pe.withStroke(linewidth=STATION_HALO_WIDTH, foreground="white")],
-        )
+    return routes_branches, stop_times, stops
 
 
 def _make_map(run_date: date):
-    reps, stop_times, stops = _load_trips_and_stops(run_date)
+    routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
+
+    # reset merge cache per request (so page refreshes are consistent)
+    for g in list(_MERGE_DAYLIGHT_CACHE.keys()):
+        _MERGE_DAYLIGHT_CACHE[g] = {}
 
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
@@ -320,101 +375,120 @@ def _make_map(run_date: date):
     )
     ax.add_artist(key)
 
-    # Station trigraphs
     _draw_station_labels(ax)
 
     for name in LONG_DISTANCE_NAMES:
-        trip0 = reps.get((name, 0))
-        trip1 = reps.get((name, 1))
-        center_trip = trip0 or trip1
-        if not center_trip:
+        if name not in routes_branches:
             continue
 
         colour = ROUTE_COLOURS.get(name, "#000000")
+        grp = _merge_group_for(name)
 
-        st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
-        st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"])
-        st_geom = st_geom.sort_values("stop_sequence")
-        if len(st_geom) < 2:
-            continue
-
-        lons = [float(v) for v in st_geom["stop_lon"].tolist()]
-        lats = [float(v) for v in st_geom["stop_lat"].tolist()]
-
-        left_lons, left_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=-1.0)
-        right_lons, right_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=+1.0)
-
-        dir_tracks = [
-            (0, left_lons, left_lats, trip0),
-            (1, right_lons, right_lats, trip1),
-        ]
-
-        for direction_id, xs, ys, dir_trip in dir_tracks:
-            if not dir_trip:
+        # Draw EACH branch for this route (this is what adds Empire Builder's Portland branch)
+        for bk, dir_map in routes_branches[name].items():
+            trip0 = dir_map.get(0)
+            trip1 = dir_map.get(1)
+            if not trip0 and not trip1:
                 continue
 
-            st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
-            st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"])
-            st_time = st_time.sort_values("stop_sequence")
-            if len(st_time) < 2:
+            center_trip = trip0 or trip1
+
+            # Geometry from center_trip
+            st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
+            st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
+            if len(st_geom) < 2:
                 continue
 
-            origin_dt_local, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
+            lons = [float(v) for v in st_geom["stop_lon"].tolist()]
+            lats = [float(v) for v in st_geom["stop_lat"].tolist()]
 
-            if direction_id == 1:
-                xs = list(reversed(xs))
-                ys = list(reversed(ys))
+            left_lons, left_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=-1.0)
+            right_lons, right_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=+1.0)
 
-            nseg = len(xs) - 1
-            nseg_time = len(st_time) - 1
-            if nseg <= 0 or nseg_time <= 0:
-                continue
+            dir_tracks = [
+                (0, left_lons, left_lats, trip0),
+                (1, right_lons, right_lats, trip1),
+            ]
 
-            for i in range(nseg):
-                j = _map_seg_index(i, nseg, nseg_time)
-                a = st_time.iloc[j]
-                b = st_time.iloc[min(j + 1, len(st_time) - 1)]
-
-                t0 = a["dep_sec"]
-                t1 = b["arr_sec"]
-                if t0 is None or t1 is None:
+            for direction_id, xs, ys, dir_trip in dir_tracks:
+                if not dir_trip:
                     continue
 
-                mid_sec = int((int(t0) + int(t1)) / 2)
-                delta_from_origin = mid_sec - origin_dep_sec
-                dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
+                st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
+                st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"]).sort_values("stop_sequence")
+                if len(st_time) < 2:
+                    continue
 
-                tz_name_here = a["stop_timezone"]
-                try:
-                    tz_here = pytz.timezone(tz_name_here)
-                except Exception:
-                    tz_here = pytz.UTC
+                origin_dt_local, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
 
-                dt_here = dt_at_origin.astimezone(tz_here)
+                if direction_id == 1:
+                    xs = list(reversed(xs))
+                    ys = list(reversed(ys))
 
-                lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
-                lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
-                sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
-                daylight = sunrise <= dt_here <= sunset
+                nseg = len(xs) - 1
+                nseg_time = len(st_time) - 1
+                if nseg <= 0 or nseg_time <= 0:
+                    continue
 
-                x0, y0 = xs[i], ys[i]
-                x1, y1 = xs[i + 1], ys[i + 1]
+                for i in range(nseg):
+                    j = _map_seg_index(i, nseg, nseg_time)
+                    a = st_time.iloc[j]
+                    b = st_time.iloc[min(j + 1, len(st_time) - 1)]
 
-                ax.plot(
-                    [x0, x1],
-                    [y0, y1],
-                    color=colour,
-                    linewidth=DAY_LINEWIDTH if daylight else NIGHT_LINEWIDTH,
-                    linestyle="-" if daylight else "--",
-                    alpha=1.0 if daylight else NIGHT_ALPHA,
-                    zorder=5,
-                )
+                    t0 = a["dep_sec"]
+                    t1 = b["arr_sec"]
+                    if t0 is None or t1 is None:
+                        continue
 
-                near_start = i < CHEVRON_SKIP_END_SEGMENTS
-                near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
-                if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
-                    heading = math.atan2((y1 - y0), (x1 - x0))
-                    _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
+                    mid_sec = int((int(t0) + int(t1)) / 2)
+                    delta_from_origin = mid_sec - origin_dep_sec
+                    dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
+
+                    tz_name_here = a["stop_timezone"]
+                    try:
+                        tz_here = pytz.timezone(tz_name_here)
+                    except Exception:
+                        tz_here = pytz.UTC
+                    dt_here = dt_at_origin.astimezone(tz_here)
+
+                    lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
+                    lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
+
+                    sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
+                    daylight = sunrise <= dt_here <= sunset
+
+                    # Merge daylight where routes share track (e.g., Sunset Limited + Texas Eagle)
+                    if grp is not None:
+                        heading_key = round(
+                            math.atan2(float(b["stop_lat"]) - float(a["stop_lat"]),
+                                       float(b["stop_lon"]) - float(a["stop_lon"])),
+                            1
+                        )
+                        seg_key = (round(lat_mid, 2), round(lon_mid, 2), heading_key)
+                        cache = _MERGE_DAYLIGHT_CACHE[grp]
+                        if seg_key in cache:
+                            daylight = cache[seg_key]
+                        else:
+                            cache[seg_key] = daylight
+
+                    x0, y0 = xs[i], ys[i]
+                    x1, y1 = xs[i + 1], ys[i + 1]
+
+                    ax.plot(
+                        [x0, x1],
+                        [y0, y1],
+                        color=colour,
+                        linewidth=DAY_LINEWIDTH if daylight else NIGHT_LINEWIDTH,
+                        linestyle="-" if daylight else "--",
+                        alpha=1.0 if daylight else NIGHT_ALPHA,
+                        zorder=5,
+                    )
+
+                    near_start = i < CHEVRON_SKIP_END_SEGMENTS
+                    near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
+                    if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
+                        heading = math.atan2((y1 - y0), (x1 - x0))
+                        _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
 
     fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     return fig
