@@ -29,6 +29,7 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
+# Order matters: put Texas Eagle before Sunset Limited so it becomes "primary" for merged daylight
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -39,8 +40,8 @@ LONG_DISTANCE_NAMES = [
     "Empire Builder",
     "Lake Shore Limited",
     "Southwest Chief",
-    "Sunset Limited",
     "Texas Eagle",
+    "Sunset Limited",
     "Silver Meteor",
     "Palmetto",
     "Floridian",
@@ -109,10 +110,13 @@ ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerat
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
 
 # ---- Merge daylight for routes that share track ----
+# Texas Eagle is primary (drawn first) because it appears earlier in LONG_DISTANCE_NAMES
 MERGE_DAYLIGHT_GROUPS = [
-    {"Sunset Limited", "Texas Eagle"},
+    {"Texas Eagle", "Sunset Limited"},
 ]
 _MERGE_DAYLIGHT_CACHE = {frozenset(g): {} for g in MERGE_DAYLIGHT_GROUPS}
+MERGE_GRID_DEG = 0.25
+MERGE_NEIGHBOR_RADIUS = 1
 
 
 def _merge_group_for(route_name: str):
@@ -263,8 +267,7 @@ def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
 
 def _branch_key_for_trip(trip_id: str, stop_times: pd.DataFrame, stops: pd.DataFrame):
     """
-    Identify a "branch" by the unordered pair of endpoint coordinates (rounded).
-    This lets us capture Empire Builder's SEA and PDX branches (and any other splits).
+    Identify a "branch" by unordered endpoints (rounded). Captures EB SEA vs PDX branches.
     """
     st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
     st = st.dropna(subset=["stop_lat", "stop_lon"]).sort_values("stop_sequence")
@@ -282,7 +285,7 @@ def _load_trips_and_stops(run_date: date):
     Returns:
       routes_branches[name][branch_key][direction_id] = trip_id
 
-    This explicitly allows multiple branches per route (notably Empire Builder to Seattle and Portland).
+    Allows multiple branches per route (Empire Builder SEA + PDX).
     """
     zip_bytes = _download_gtfs_zip_bytes()
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -312,10 +315,8 @@ def _load_trips_and_stops(run_date: date):
     stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
     stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
 
-    # Stop count per trip (used to choose a representative trip per branch+direction)
     trip_stop_counts = stop_times.groupby("trip_id").size().to_dict()
 
-    # Build branches per route+direction by endpoints
     candidates = defaultdict(list)  # (route_name, direction_id, branch_key) -> [trip_id...]
     for _, r in trips.iterrows():
         name = r["route_long_name"]
@@ -326,10 +327,8 @@ def _load_trips_and_stops(run_date: date):
             continue
         candidates[(name, direction, bk)].append(tid)
 
-    # Pick best trip per branch+direction. For Empire Builder, we keep BOTH branches if present.
     routes_branches = defaultdict(lambda: defaultdict(dict))  # name -> branch_key -> {dir: trip_id}
     for (name, direction, bk), tids in candidates.items():
-        # choose the trip with the most stops for that branch+direction
         best = max(tids, key=lambda t: trip_stop_counts.get(t, 0))
         routes_branches[name][bk][direction] = best
 
@@ -342,13 +341,13 @@ def _load_trips_and_stops(run_date: date):
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
 
-    # reset merge cache per request (so page refreshes are consistent)
+    # reset merge cache per request
     for g in list(_MERGE_DAYLIGHT_CACHE.keys()):
         _MERGE_DAYLIGHT_CACHE[g] = {}
 
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
-        f"Amtrak Long-Distance Routes — Both Directions (parallel tracks)\nDaylight vs Darkness — {run_date}",
+        f"Amtrak Long-Distance Routes\nDaylight vs Darkness — {run_date}",
         fontsize=14,
     )
     ax.set_xlim(-125, -66)
@@ -357,11 +356,16 @@ def _make_map(run_date: date):
     ax.set_ylabel("Latitude")
     ax.grid(True, linewidth=0.3, alpha=0.20)
 
-    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
-    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
-    ax.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
+    # Day/Night style legend (separate, so it's always visible)
+    style_handles = [
+        mlines.Line2D([], [], color="black", lw=DAY_LINEWIDTH, linestyle="-", label="Daylight"),
+        mlines.Line2D([], [], color="black", lw=NIGHT_LINEWIDTH, linestyle="--", alpha=NIGHT_ALPHA, label="Darkness"),
+    ]
+    style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=False)
+    ax.add_artist(style_leg)
 
+    # Route colour key
+    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
     key = ax.legend(
         handles=legend_routes,
         loc="upper left",
@@ -384,7 +388,7 @@ def _make_map(run_date: date):
         colour = ROUTE_COLOURS.get(name, "#000000")
         grp = _merge_group_for(name)
 
-        # Draw EACH branch for this route (this is what adds Empire Builder's Portland branch)
+        # Draw each branch for the route (adds Empire Builder PDX branch if present)
         for bk, dir_map in routes_branches[name].items():
             trip0 = dir_map.get(0)
             trip1 = dir_map.get(1)
@@ -393,7 +397,6 @@ def _make_map(run_date: date):
 
             center_trip = trip0 or trip1
 
-            # Geometry from center_trip
             st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
             st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
             if len(st_geom) < 2:
@@ -457,19 +460,26 @@ def _make_map(run_date: date):
                     sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
                     daylight = sunrise <= dt_here <= sunset
 
-                    # Merge daylight where routes share track (e.g., Sunset Limited + Texas Eagle)
+                    # Merge daylight where routes share track (Texas Eagle is primary)
                     if grp is not None:
-                        heading_key = round(
-                            math.atan2(float(b["stop_lat"]) - float(a["stop_lat"]),
-                                       float(b["stop_lon"]) - float(a["stop_lon"])),
-                            1
-                        )
-                        seg_key = (round(lat_mid, 2), round(lon_mid, 2), heading_key)
                         cache = _MERGE_DAYLIGHT_CACHE[grp]
-                        if seg_key in cache:
-                            daylight = cache[seg_key]
+                        gx = int(round(lon_mid / MERGE_GRID_DEG))
+                        gy = int(round(lat_mid / MERGE_GRID_DEG))
+
+                        found = None
+                        for dx in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
+                            for dy in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
+                                k = (gx + dx, gy + dy)
+                                if k in cache:
+                                    found = cache[k]
+                                    break
+                            if found is not None:
+                                break
+
+                        if found is not None:
+                            daylight = found
                         else:
-                            cache[seg_key] = daylight
+                            cache[(gx, gy)] = daylight
 
                     x0, y0 = xs[i], ys[i]
                     x1, y1 = xs[i + 1], ys[i + 1]
