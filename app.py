@@ -320,7 +320,10 @@ def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
     except Exception:
         tz = pytz.UTC
 
-    origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
+    origin_dt_local = tz.localize(
+        datetime(run_date.year, run_date.month, run_date.day)
+        + timedelta(seconds=int(origin_dep_sec))
+    )
     return origin_dt_local, int(origin_dep_sec)
 
 
@@ -345,8 +348,16 @@ def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
     right_x = tip_x + math.cos(right_dir) * (s * 0.85)
     right_y = tip_y + math.sin(right_dir) * (s * 0.85)
 
-    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
-    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
+    ax.plot(
+        [left_x, tip_x], [left_y, tip_y],
+        color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT,
+        zorder=CHEVRON_ZORDER
+    )
+    ax.plot(
+        [right_x, tip_x], [right_y, tip_y],
+        color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT,
+        zorder=CHEVRON_ZORDER
+    )
 
 
 def _classify_light_civil_with_sampling(origin_dt_local, origin_dep_sec: int, a_row, b_row, tz_name_here: str) -> bool:
@@ -448,11 +459,13 @@ def _compute_route_bounds(routes_branches, stop_times, stops):
     return min_lon, max_lon, min_lat, max_lat
 
 
+# -------------------- STATES (GeoJSON) --------------------
+
 def _ensure_states_loaded():
     if _STATES_CACHE["loaded"]:
         return
 
-    lines = []
+    polylines = []
 
     if not os.path.exists(STATES_GEOJSON_PATH):
         print("States GeoJSON missing:", STATES_GEOJSON_PATH)
@@ -465,26 +478,41 @@ def _ensure_states_loaded():
             gj = json.load(f)
 
         feats = gj.get("features", [])
+
+        DROP = {"US-PR", "US-VI", "US-GU", "US-AS", "US-MP"}
+
+        def add_ring(ring):
+            if not ring or len(ring) < 2:
+                return
+            stride = max(1, int(STATE_POINT_STRIDE))
+            xs = [pt[0] for pt in ring[::stride]]
+            ys = [pt[1] for pt in ring[::stride]]
+            polylines.append((xs, ys))
+
         for feat in feats:
+            props = feat.get("properties") or {}
+            iso = props.get("iso_3166_2") or props.get("ISO_3166_2") or props.get("iso") or ""
+            if isinstance(iso, str) and iso in DROP:
+                continue
+
             geom = feat.get("geometry") or {}
             gtype = geom.get("type")
             coords = geom.get("coordinates")
             if not coords:
                 continue
 
-            # We only draw polygon outlines (exterior rings).
             if gtype == "Polygon":
-                # coords: [ring0, ring1...]
-                ring0 = coords[0]
-                lines.append(ring0)
-            elif gtype == "MultiPolygon":
-                # coords: [[ring0,...],[ring0,...],...]
-                for poly in coords:
-                    if poly and poly[0]:
-                        lines.append(poly[0])
+                for ring in coords:
+                    add_ring(ring)
 
-        _STATES_CACHE["lines"] = lines
+            elif gtype == "MultiPolygon":
+                for poly in coords:
+                    for ring in poly:
+                        add_ring(ring)
+
+        _STATES_CACHE["lines"] = polylines
         _STATES_CACHE["loaded"] = True
+
     except Exception as e:
         print("Failed to load states GeoJSON:", e)
         _STATES_CACHE["lines"] = []
@@ -493,33 +521,29 @@ def _ensure_states_loaded():
 
 def _draw_state_boundaries(ax):
     _ensure_states_loaded()
-    if not _STATES_CACHE["lines"]:
+    lines = _STATES_CACHE["lines"]
+    if not lines:
         return
 
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
 
-    for ring in _STATES_CACHE["lines"]:
-        # ring is list of [lon, lat] pairs
-        xs = []
-        ys = []
-        stride = max(1, int(STATE_POINT_STRIDE))
+    for xs, ys in lines:
+        if not xs or not ys:
+            continue
+        if (max(xs) < x0) or (min(xs) > x1) or (max(ys) < y0) or (min(ys) > y1):
+            continue
 
-        for i in range(0, len(ring), stride):
-            lon, lat = ring[i][0], ring[i][1]
-            # quick clip to view window with a small buffer
-            if (x0 - 2) <= lon <= (x1 + 2) and (y0 - 2) <= lat <= (y1 + 2):
-                xs.append(lon)
-                ys.append(lat)
-            else:
-                # keep breaks to avoid long diagonal lines from far-away clipped points
-                if len(xs) >= 2:
-                    ax.plot(xs, ys, color=STATE_LINE_COLOUR, lw=STATE_LINEWIDTH, alpha=STATE_ALPHA, zorder=STATE_ZORDER)
-                xs, ys = [], []
+        ax.plot(
+            xs, ys,
+            color=STATE_LINE_COLOUR,
+            lw=STATE_LINEWIDTH,
+            alpha=STATE_ALPHA,
+            zorder=STATE_ZORDER
+        )
 
-        if len(xs) >= 2:
-            ax.plot(xs, ys, color=STATE_LINE_COLOUR, lw=STATE_LINEWIDTH, alpha=STATE_ALPHA, zorder=STATE_ZORDER)
 
+# -------------------- MAP --------------------
 
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
@@ -658,7 +682,13 @@ def _make_map(run_date: date):
                         near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
                         if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
                             heading = math.atan2((y1 - y0), (x1 - x0))
-                            _draw_chevron_night_only(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour)
+                            _draw_chevron_night_only(
+                                ax,
+                                (x0 + x1) / 2.0,
+                                (y0 + y1) / 2.0,
+                                heading,
+                                colour
+                            )
 
     fig.tight_layout()
     return fig
@@ -672,6 +702,8 @@ def build_png_bytes(run_date: date) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
+
+# -------------------- WEB --------------------
 
 @app.get("/")
 def index():
