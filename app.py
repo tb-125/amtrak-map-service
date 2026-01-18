@@ -50,8 +50,8 @@ DAY_LINEWIDTH = 2.6
 NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
-# ---- Parallel separation (this is the gap you care about) ----
-PARALLEL_GAP_DEG = 0.34   # try 0.28–0.45
+# ---- Parallel separation (50% closer than 0.34) ----
+PARALLEL_GAP_DEG = 0.17
 
 # ---- Labels ----
 ROUTE_LABEL_FONTSIZE = 6.5
@@ -141,11 +141,7 @@ def _perp_unit(dx, dy):
 
 def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
     """
-    Make a perfectly parallel copy of a polyline:
-    - compute a local tangent at each vertex using neighbours
-    - use its perpendicular as offset direction
-    - offset every vertex by (gap_deg * side_sign) in that perpendicular
-    This keeps it smooth and "track-like".
+    Smooth "track-like" offset polyline using a local tangent per vertex.
     """
     n = len(lons)
     if n < 2:
@@ -228,7 +224,6 @@ def _load_trips(run_date: date):
     stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
     stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
 
-    # representative trip per route+direction
     reps = {}
     for (name, direction), grp in trips.groupby(["route_long_name", "direction_id"]):
         counts = stop_times[stop_times["trip_id"].isin(grp["trip_id"])].groupby("trip_id").size()
@@ -241,15 +236,27 @@ def _load_trips(run_date: date):
     return reps, stop_times, stops
 
 
+def _map_seg_index(i, nseg_geom, nseg_time):
+    """
+    Map geometry segment index -> time segment index, even if stop counts differ.
+    """
+    if nseg_geom <= 1 or nseg_time <= 1:
+        return min(i, max(0, nseg_time - 1))
+    return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
+
+
 def _make_map(run_date: date):
     """
     One map. For each service, take a single "centerline" and draw two parallel tracks around it.
-    This guarantees proper parallelism and a clear gap.
+    Direction 0 uses its own schedule for daylight/dark. Direction 1 uses its own schedule and is drawn reversed.
     """
     reps, stop_times, stops = _load_trips(run_date)
 
     fig, ax = plt.subplots(figsize=(18, 10))
-    ax.set_title(f"Amtrak Long-Distance Routes — Both Directions (parallel tracks)\nDaylight vs Darkness — {run_date}", fontsize=14)
+    ax.set_title(
+        f"Amtrak Long-Distance Routes — Both Directions (parallel tracks)\nDaylight vs Darkness — {run_date}",
+        fontsize=14,
+    )
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
     ax.set_xlabel("Longitude")
@@ -279,42 +286,56 @@ def _make_map(run_date: date):
         trip0 = reps.get((name, 0))
         trip1 = reps.get((name, 1))
 
-        # choose whichever direction exists to define the centerline
+        # Pick a geometry-defining trip (prefer whichever exists)
         center_trip = trip0 or trip1
         if not center_trip:
             continue
 
         colour = ROUTE_COLOURS.get(name, "#000000")
 
-        st = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
-        st = st.dropna(subset=["stop_lat", "stop_lon", "dep_sec", "arr_sec", "stop_timezone"])
-        if len(st) < 2:
+        # Geometry from center_trip
+        st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
+        st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"])
+        st_geom = st_geom.sort_values("stop_sequence")
+        if len(st_geom) < 2:
             continue
 
-        # centerline coordinates
-        lons = [float(v) for v in st["stop_lon"].tolist()]
-        lats = [float(v) for v in st["stop_lat"].tolist()]
+        lons = [float(v) for v in st_geom["stop_lon"].tolist()]
+        lats = [float(v) for v in st_geom["stop_lat"].tolist()]
 
-        # build the two parallel tracks (left and right of centerline)
         left_lons, left_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=-1.0)
         right_lons, right_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=+1.0)
 
-        # Now: we still want directionality.
-        # We'll draw west/south on the left track (if available) and east/north on the right track (if available).
-        # If a direction is missing, we still draw the track but without chevrons (rare).
         dir_tracks = [
             (0, left_lons, left_lats, trip0),
             (1, right_lons, right_lats, trip1),
         ]
 
         for direction_id, xs, ys, dir_trip in dir_tracks:
-            # If this direction has a different trip (different stops), we still use the *centerline geometry*
-            # to guarantee perfect parallel tracks. Times/daylight are approximated from center_trip.
+            # Load direction-specific timing+position if we have it, else fallback to geometry trip
+            if dir_trip:
+                st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
+                st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"])
+                st_time = st_time.sort_values("stop_sequence")
+            else:
+                st_time = st_geom.copy()
+                st_time["dep_sec"] = stop_times[stop_times["trip_id"] == center_trip]["dep_sec"].values[: len(st_time)]
+                st_time["arr_sec"] = stop_times[stop_times["trip_id"] == center_trip]["arr_sec"].values[: len(st_time)]
+
+            # Reverse geometry for direction 1 so chevrons and progression are opposite
+            if direction_id == 1:
+                xs = list(reversed(xs))
+                ys = list(reversed(ys))
+
             nseg = len(xs) - 1
+            nseg_time = len(st_time) - 1
+            if nseg <= 0:
+                continue
+
             for i in range(nseg):
-                # use center_trip times for daylight classification (consistent and stable)
-                a = st.iloc[i]
-                b = st.iloc[i + 1]
+                j = _map_seg_index(i, nseg, nseg_time)
+                a = st_time.iloc[j]
+                b = st_time.iloc[min(j + 1, len(st_time) - 1)]
 
                 t0 = a["dep_sec"]
                 t1 = b["arr_sec"]
@@ -330,8 +351,8 @@ def _make_map(run_date: date):
                 except Exception:
                     dt_local = pytz.UTC.localize(dt_naive)
 
-                lat_mid = (lats[i] + lats[i + 1]) / 2.0
-                lon_mid = (lons[i] + lons[i + 1]) / 2.0
+                lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
+                lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
                 daylight = _is_daylight(lat_mid, lon_mid, tz_name, dt_local)
 
                 x0, y0 = xs[i], ys[i]
@@ -347,7 +368,6 @@ def _make_map(run_date: date):
                     zorder=5,
                 )
 
-                # chevrons only if that direction exists
                 if dir_trip:
                     near_start = i < CHEVRON_SKIP_END_SEGMENTS
                     near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
@@ -355,7 +375,7 @@ def _make_map(run_date: date):
                         heading = math.atan2((y1 - y0), (x1 - x0))
                         _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
 
-            # direction label (same route name, positioned near midpoint, pushed outward)
+            # One label per direction track, offset outward
             mid = len(xs) // 2
             i0 = max(0, mid - 1)
             i1 = min(len(xs) - 1, mid)
@@ -476,5 +496,8 @@ def map_pdf():
         abort(500, f"Failed to generate PDF: {e}")
 
     filename = f"amtrak_long_distance_daylight_{run_date}.pdf"
-    return Response(pdf_bytes, mimetype="application/pdf",
-                    headers={"Content-Disposition": f'inline; filename=\"{filename}\"'})
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
