@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# Order matters: put Texas Eagle before Sunset Limited so it becomes "primary" for merged daylight
+# Order matters: Texas Eagle before Sunset Limited so Texas Eagle is "primary" for merging
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -110,11 +110,14 @@ ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerat
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
 
 # ---- Merge daylight for routes that share track ----
-# Texas Eagle is primary (drawn first) because it appears earlier in LONG_DISTANCE_NAMES
+# Direction-aware merge so eastbound and westbound remain different.
 MERGE_DAYLIGHT_GROUPS = [
     {"Texas Eagle", "Sunset Limited"},
 ]
-_MERGE_DAYLIGHT_CACHE = {frozenset(g): {} for g in MERGE_DAYLIGHT_GROUPS}
+# cache: group -> { direction_id -> { (gx,gy) : daylight_bool } }
+_MERGE_DAYLIGHT_CACHE = {frozenset(g): {0: {}, 1: {}} for g in MERGE_DAYLIGHT_GROUPS}
+
+# Coarse grid for geographic merging
 MERGE_GRID_DEG = 0.25
 MERGE_NEIGHBOR_RADIUS = 1
 
@@ -343,7 +346,7 @@ def _make_map(run_date: date):
 
     # reset merge cache per request
     for g in list(_MERGE_DAYLIGHT_CACHE.keys()):
-        _MERGE_DAYLIGHT_CACHE[g] = {}
+        _MERGE_DAYLIGHT_CACHE[g] = {0: {}, 1: {}}
 
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
@@ -356,28 +359,25 @@ def _make_map(run_date: date):
     ax.set_ylabel("Latitude")
     ax.grid(True, linewidth=0.3, alpha=0.20)
 
-    # Day/Night style legend (separate, so it's always visible)
+    # Day/Night style legend (lower left)
     style_handles = [
         mlines.Line2D([], [], color="black", lw=DAY_LINEWIDTH, linestyle="-", label="Daylight"),
         mlines.Line2D([], [], color="black", lw=NIGHT_LINEWIDTH, linestyle="--", alpha=NIGHT_ALPHA, label="Darkness"),
     ]
-    style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=False)
+    style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=True)
     ax.add_artist(style_leg)
 
-    # Route colour key
+    # Route colour key INSIDE bottom right
     legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    key = ax.legend(
+    route_leg = ax.legend(
         handles=legend_routes,
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1.00),
-        borderaxespad=0.0,
+        loc="lower right",
         fontsize=8,
-        frameon=False,
+        frameon=True,
         title="Train services",
         title_fontsize=9,
-        ncol=1,
     )
-    ax.add_artist(key)
+    ax.add_artist(route_leg)
 
     _draw_station_labels(ax)
 
@@ -388,8 +388,8 @@ def _make_map(run_date: date):
         colour = ROUTE_COLOURS.get(name, "#000000")
         grp = _merge_group_for(name)
 
-        # Draw each branch for the route (adds Empire Builder PDX branch if present)
-        for bk, dir_map in routes_branches[name].items():
+        # Draw each branch for the route (Empire Builder includes SEA + PDX branches if present)
+        for _, dir_map in routes_branches[name].items():
             trip0 = dir_map.get(0)
             trip1 = dir_map.get(1)
             if not trip0 and not trip1:
@@ -424,6 +424,7 @@ def _make_map(run_date: date):
 
                 origin_dt_local, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
 
+                # Reverse drawn geometry for direction 1 so chevrons point opposite
                 if direction_id == 1:
                     xs = list(reversed(xs))
                     ys = list(reversed(ys))
@@ -460,9 +461,9 @@ def _make_map(run_date: date):
                     sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
                     daylight = sunrise <= dt_here <= sunset
 
-                    # Merge daylight where routes share track (Texas Eagle is primary)
+                    # Merge daylight where routes share track — direction-aware
                     if grp is not None:
-                        cache = _MERGE_DAYLIGHT_CACHE[grp]
+                        cache_dir = _MERGE_DAYLIGHT_CACHE[grp][direction_id]
                         gx = int(round(lon_mid / MERGE_GRID_DEG))
                         gy = int(round(lat_mid / MERGE_GRID_DEG))
 
@@ -470,8 +471,8 @@ def _make_map(run_date: date):
                         for dx in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
                             for dy in range(-MERGE_NEIGHBOR_RADIUS, MERGE_NEIGHBOR_RADIUS + 1):
                                 k = (gx + dx, gy + dy)
-                                if k in cache:
-                                    found = cache[k]
+                                if k in cache_dir:
+                                    found = cache_dir[k]
                                     break
                             if found is not None:
                                 break
@@ -479,7 +480,7 @@ def _make_map(run_date: date):
                         if found is not None:
                             daylight = found
                         else:
-                            cache[(gx, gy)] = daylight
+                            cache_dir[(gx, gy)] = daylight
 
                     x0, y0 = xs[i], ys[i]
                     x1, y1 = xs[i + 1], ys[i + 1]
@@ -500,7 +501,7 @@ def _make_map(run_date: date):
                         heading = math.atan2((y1 - y0), (x1 - x0))
                         _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
 
-    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    fig.tight_layout()
     return fig
 
 
