@@ -64,7 +64,7 @@ LABEL_OFFSET_DEGREES = 0.28  # how far label sits off the track
 # ---- Direction separation ("small gap" between directions) ----
 # This is the perpendicular offset applied to each segment.
 # Increase slightly if you want the two directions more clearly separated.
-DIRECTION_GAP_DEG = 0.11  # ~small; try 0.08–0.16
+DIRECTION_GAP_DEG = 0.20  # ~small; try 0.08–0.16
 
 # ---- Chevrons (unfilled) ----
 CHEVRON_EVERY_N_SEGMENTS = 18
