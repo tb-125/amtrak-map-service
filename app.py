@@ -51,22 +51,29 @@ NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
 # ---- Parallel separation ----
-PARALLEL_GAP_DEG = 0.17  # 50% closer than 0.34
+PARALLEL_GAP_DEG = 0.17
 
-# ---- Labels ----
-ROUTE_LABEL_FONTSIZE = 6.5
-LABEL_HALO_WIDTH = 2.2
-LABEL_OUTWARD_EXTRA_DEG = 0.20
+# ---- Station label styling ----
+STATION_FONTSIZE = 7.0
+STATION_HALO_WIDTH = 2.6
 
-# ---- Chevrons (make them clearly visible) ----
-CHEVRON_EVERY_N_SEGMENTS = 10          # more frequent
-CHEVRON_SKIP_END_SEGMENTS = 3          # fewer skipped
-CHEVRON_SIZE_DEG = 0.13                # bigger
+# A small, curated set of trigraphs to avoid clutter.
+# These are used only if they exist in the GTFS stops list.
+KEY_STATION_CODES = [
+    "SEA", "PDX", "SAC", "EMY", "SJC", "LAX", "SAN",
+    "ABQ", "DEN", "SLC", "CHI", "STL", "MSP",
+    "NOL", "ATL", "WAS", "NYP", "BOS", "PHL", "BAL", "CLT", "ORL", "MIA",
+]
+
+# ---- Chevrons (bigger) ----
+CHEVRON_EVERY_N_SEGMENTS = 10
+CHEVRON_SKIP_END_SEGMENTS = 3
+CHEVRON_SIZE_DEG = 0.18      # bigger than before
 CHEVRON_ANGLE_DEG = 24
-CHEVRON_LW_DAY = 0.90                  # thicker
-CHEVRON_LW_NIGHT = 0.75
-CHEVRON_ALPHA_DAY = 0.95               # more opaque
-CHEVRON_ALPHA_NIGHT = 0.70
+CHEVRON_LW_DAY = 1.05        # slightly thicker
+CHEVRON_LW_NIGHT = 0.90
+CHEVRON_ALPHA_DAY = 0.95
+CHEVRON_ALPHA_NIGHT = 0.75
 CHEVRON_ZORDER = 10
 
 # ---- Fixed colours ----
@@ -104,9 +111,6 @@ def _read_txt(z: zipfile.ZipFile, name: str) -> pd.DataFrame:
 
 
 def _parse_gtfs_time(t):
-    """
-    GTFS times can exceed 24:00:00. Keep as seconds since service-day midnight.
-    """
     if pd.isna(t) or not isinstance(t, str) or not t.strip():
         return None
     h, m, s = t.split(":")
@@ -147,9 +151,6 @@ def _perp_unit(dx, dy):
 
 
 def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
-    """
-    Smooth offset polyline using a local tangent per vertex.
-    """
     n = len(lons)
     if n < 2:
         return lons, lats
@@ -197,11 +198,7 @@ def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
     ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
 
 
-def _load_trips(run_date: date):
-    """
-    Load GTFS; filter services active on run_date; choose a representative trip per (route, direction)
-    by selecting the trip with the most stops.
-    """
+def _load_trips_and_stops(run_date: date):
     zip_bytes = _download_gtfs_zip_bytes()
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
 
@@ -227,8 +224,14 @@ def _load_trips(run_date: date):
     stop_times["dep_sec"] = stop_times["departure_time"].apply(_parse_gtfs_time)
     stop_times = stop_times.sort_values(["trip_id", "stop_sequence"])
 
-    stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
+    # Stops often contain stop_code with trigraphs (not always). We'll use it if present.
+    stops_cols = ["stop_id", "stop_lat", "stop_lon", "stop_timezone"]
+    if "stop_code" in stops.columns:
+        stops_cols.append("stop_code")
+    stops = stops[stops_cols].copy()
     stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
+    if "stop_code" not in stops.columns:
+        stops["stop_code"] = None
 
     reps = {}
     for (name, direction), grp in trips.groupby(["route_long_name", "direction_id"]):
@@ -243,27 +246,16 @@ def _load_trips(run_date: date):
 
 
 def _map_seg_index(i, nseg_geom, nseg_time):
-    """
-    Map geometry segment index -> time segment index, even if stop counts differ.
-    """
     if nseg_geom <= 1 or nseg_time <= 1:
         return min(i, max(0, nseg_time - 1))
     return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
 
 
 def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
-    """
-    Anchor the trip to its FIRST departure time in its FIRST stop timezone.
-    This greatly improves daylight correctness vs treating all times as from midnight everywhere.
-    """
-    if len(st_time) == 0:
-        return None, None, None
-
     first = st_time.iloc[0]
     origin_tz = first["stop_timezone"]
     origin_dep_sec = first["dep_sec"]
     if origin_dep_sec is None or pd.isna(origin_dep_sec):
-        # fallback: use arr_sec
         origin_dep_sec = first["arr_sec"]
 
     try:
@@ -271,19 +263,42 @@ def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
     except Exception:
         tz = pytz.UTC
 
-    # Service day "run_date" is taken as the origin service day in origin timezone
     origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
+    return origin_dt_local, int(origin_dep_sec)
 
-    return origin_dt_local, tz, int(origin_dep_sec)
+
+def _draw_station_labels(ax, stops: pd.DataFrame):
+    """
+    Draw a curated set of station trigraphs (stop_code) if present.
+    We only label those in KEY_STATION_CODES to keep it uncluttered.
+    """
+    if "stop_code" not in stops.columns:
+        return
+
+    stops2 = stops.dropna(subset=["stop_lat", "stop_lon"]).copy()
+    stops2["stop_code"] = stops2["stop_code"].fillna("").astype(str).str.strip()
+    stops2 = stops2[stops2["stop_code"].isin(KEY_STATION_CODES)]
+
+    # If duplicates exist (multiple stop_ids share same code), take the first
+    stops2 = stops2.drop_duplicates(subset=["stop_code"])
+
+    for _, r in stops2.iterrows():
+        code = r["stop_code"]
+        x = float(r["stop_lon"])
+        y = float(r["stop_lat"])
+
+        ax.text(
+            x, y, code,
+            fontsize=STATION_FONTSIZE,
+            ha="center", va="center",
+            color="black",
+            zorder=20,
+            path_effects=[pe.withStroke(linewidth=STATION_HALO_WIDTH, foreground="white")],
+        )
 
 
 def _make_map(run_date: date):
-    """
-    One map. For each service, draw two parallel tracks.
-    Each track uses its OWN trip timing anchored to origin departure -> better daylight accuracy.
-    Direction 1 is drawn reversed so the chevrons point opposite.
-    """
-    reps, stop_times, stops = _load_trips(run_date)
+    reps, stop_times, stops = _load_trips_and_stops(run_date)
 
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
@@ -314,6 +329,9 @@ def _make_map(run_date: date):
     )
     ax.add_artist(key)
 
+    # Station labels (trigraphs)
+    _draw_station_labels(ax, stops)
+
     for name in LONG_DISTANCE_NAMES:
         trip0 = reps.get((name, 0))
         trip1 = reps.get((name, 1))
@@ -323,7 +341,6 @@ def _make_map(run_date: date):
 
         colour = ROUTE_COLOURS.get(name, "#000000")
 
-        # Geometry from center_trip
         st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
         st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"])
         st_geom = st_geom.sort_values("stop_sequence")
@@ -343,7 +360,6 @@ def _make_map(run_date: date):
 
         for direction_id, xs, ys, dir_trip in dir_tracks:
             if not dir_trip:
-                # If a direction is missing in GTFS for this date, skip that track
                 continue
 
             st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
@@ -352,11 +368,8 @@ def _make_map(run_date: date):
             if len(st_time) < 2:
                 continue
 
-            origin_dt_local, origin_tz, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
-            if origin_dt_local is None:
-                continue
+            origin_dt_local, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
 
-            # Reverse geometry for direction 1 so chevrons/progression are opposite
             if direction_id == 1:
                 xs = list(reversed(xs))
                 ys = list(reversed(ys))
@@ -377,8 +390,6 @@ def _make_map(run_date: date):
                     continue
 
                 mid_sec = int((int(t0) + int(t1)) / 2)
-
-                # Compute absolute datetime by offset from origin departure, then convert to local tz at this segment
                 delta_from_origin = mid_sec - origin_dep_sec
                 dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
 
@@ -392,7 +403,8 @@ def _make_map(run_date: date):
 
                 lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
                 lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
-                daylight = _is_daylight_at(lat_mid, lon_mid, tz_name_here, dt_here)
+                sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
+                daylight = sunrise <= dt_here <= sunset
 
                 x0, y0 = xs[i], ys[i]
                 x1, y1 = xs[i + 1], ys[i + 1]
@@ -407,36 +419,11 @@ def _make_map(run_date: date):
                     zorder=5,
                 )
 
-                # Chevrons
                 near_start = i < CHEVRON_SKIP_END_SEGMENTS
                 near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
                 if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
                     heading = math.atan2((y1 - y0), (x1 - x0))
                     _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
-
-            # Label once per direction track, offset outward
-            mid = len(xs) // 2
-            i0 = max(0, mid - 1)
-            i1 = min(len(xs) - 1, mid)
-            dx = xs[i1] - xs[i0]
-            dy = ys[i1] - ys[i0]
-            ux, uy = _perp_unit(dx, dy)
-
-            outward = -1.0 if direction_id == 0 else 1.0
-            xm = (xs[i0] + xs[i1]) / 2.0 + ux * LABEL_OUTWARD_EXTRA_DEG * outward
-            ym = (ys[i0] + ys[i1]) / 2.0 + uy * LABEL_OUTWARD_EXTRA_DEG * outward
-
-            ax.text(
-                xm, ym,
-                name,
-                fontsize=ROUTE_LABEL_FONTSIZE,
-                weight="bold",
-                ha="center",
-                va="center",
-                color=colour,
-                zorder=7,
-                path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
-            )
 
     fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     return fig
