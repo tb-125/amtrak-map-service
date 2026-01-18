@@ -57,20 +57,40 @@ PARALLEL_GAP_DEG = 0.17
 STATION_FONTSIZE = 7.0
 STATION_HALO_WIDTH = 2.6
 
-# A small, curated set of trigraphs to avoid clutter.
-# These are used only if they exist in the GTFS stops list.
-KEY_STATION_CODES = [
-    "SEA", "PDX", "SAC", "EMY", "SJC", "LAX", "SAN",
-    "ABQ", "DEN", "SLC", "CHI", "STL", "MSP",
-    "NOL", "ATL", "WAS", "NYP", "BOS", "PHL", "BAL", "CLT", "ORL", "MIA",
+# Curated station trigraphs with approximate coordinates (kept sparse to avoid clutter)
+STATION_MARKERS = [
+    ("SEA", -122.3301, 47.6038),
+    ("PDX", -122.6765, 45.5231),
+    ("SAC", -121.4944, 38.5816),
+    ("EMY", -122.2920, 37.8400),
+    ("SJC", -121.9010, 37.3290),
+    ("LAX", -118.2437, 34.0522),
+    ("SAN", -117.1611, 32.7157),
+
+    ("DEN", -104.9903, 39.7392),
+    ("SLC", -111.8910, 40.7608),
+    ("ABQ", -106.6504, 35.0844),
+
+    ("CHI", -87.6300, 41.8819),
+    ("STL", -90.1994, 38.6270),
+    ("MSP", -93.2650, 44.9778),
+
+    ("NOL", -90.0715, 29.9511),
+    ("ATL", -84.3880, 33.7490),
+
+    ("WAS", -77.0067, 38.8977),
+    ("PHL", -75.1652, 39.9526),
+    ("NYP", -73.9940, 40.7527),
+    ("BOS", -71.0589, 42.3601),
+    ("MIA", -80.1918, 25.7617),
 ]
 
-# ---- Chevrons (bigger) ----
+# ---- Chevrons (double size) ----
 CHEVRON_EVERY_N_SEGMENTS = 10
 CHEVRON_SKIP_END_SEGMENTS = 3
-CHEVRON_SIZE_DEG = 0.18      # bigger than before
+CHEVRON_SIZE_DEG = 0.36          # doubled
 CHEVRON_ANGLE_DEG = 24
-CHEVRON_LW_DAY = 1.05        # slightly thicker
+CHEVRON_LW_DAY = 1.05
 CHEVRON_LW_NIGHT = 0.90
 CHEVRON_ALPHA_DAY = 0.95
 CHEVRON_ALPHA_NIGHT = 0.75
@@ -136,11 +156,6 @@ def _sun_times(lat: float, lon: float, tz_name: str, on_date: date):
     loc = LocationInfo(latitude=lat, longitude=lon, timezone=getattr(tz, "zone", "UTC"))
     s = sun(loc.observer, date=on_date, tzinfo=tz)
     return s["sunrise"], s["sunset"]
-
-
-def _is_daylight_at(lat: float, lon: float, tz_name: str, dt_local) -> bool:
-    sunrise, sunset = _sun_times(lat, lon, tz_name, dt_local.date())
-    return sunrise <= dt_local <= sunset
 
 
 def _perp_unit(dx, dy):
@@ -224,14 +239,8 @@ def _load_trips_and_stops(run_date: date):
     stop_times["dep_sec"] = stop_times["departure_time"].apply(_parse_gtfs_time)
     stop_times = stop_times.sort_values(["trip_id", "stop_sequence"])
 
-    # Stops often contain stop_code with trigraphs (not always). We'll use it if present.
-    stops_cols = ["stop_id", "stop_lat", "stop_lon", "stop_timezone"]
-    if "stop_code" in stops.columns:
-        stops_cols.append("stop_code")
-    stops = stops[stops_cols].copy()
+    stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
     stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
-    if "stop_code" not in stops.columns:
-        stops["stop_code"] = None
 
     reps = {}
     for (name, direction), grp in trips.groupby(["route_long_name", "direction_id"]):
@@ -267,28 +276,10 @@ def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
     return origin_dt_local, int(origin_dep_sec)
 
 
-def _draw_station_labels(ax, stops: pd.DataFrame):
-    """
-    Draw a curated set of station trigraphs (stop_code) if present.
-    We only label those in KEY_STATION_CODES to keep it uncluttered.
-    """
-    if "stop_code" not in stops.columns:
-        return
-
-    stops2 = stops.dropna(subset=["stop_lat", "stop_lon"]).copy()
-    stops2["stop_code"] = stops2["stop_code"].fillna("").astype(str).str.strip()
-    stops2 = stops2[stops2["stop_code"].isin(KEY_STATION_CODES)]
-
-    # If duplicates exist (multiple stop_ids share same code), take the first
-    stops2 = stops2.drop_duplicates(subset=["stop_code"])
-
-    for _, r in stops2.iterrows():
-        code = r["stop_code"]
-        x = float(r["stop_lon"])
-        y = float(r["stop_lat"])
-
+def _draw_station_labels(ax):
+    for code, lon, lat in STATION_MARKERS:
         ax.text(
-            x, y, code,
+            lon, lat, code,
             fontsize=STATION_FONTSIZE,
             ha="center", va="center",
             color="black",
@@ -329,8 +320,8 @@ def _make_map(run_date: date):
     )
     ax.add_artist(key)
 
-    # Station labels (trigraphs)
-    _draw_station_labels(ax, stops)
+    # Station trigraphs
+    _draw_station_labels(ax)
 
     for name in LONG_DISTANCE_NAMES:
         trip0 = reps.get((name, 0))
