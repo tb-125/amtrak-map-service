@@ -27,7 +27,12 @@ from flask import Flask, Response, request, abort
 app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
-US_STATES_GEOJSON_URL = "https://cdn.jsdelivr.net/gh/PublicaMundi/MappingAPI@master/data/us-states.json"
+
+# Basemap sources (try CDN first, then GitHub raw)
+US_STATES_GEOJSON_URLS = [
+    "https://cdn.jsdelivr.net/gh/PublicaMundi/MappingAPI@master/data/us-states.json",
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/us-states.json",
+]
 
 LONG_DISTANCE_NAMES = [
     "Auto Train",
@@ -46,25 +51,25 @@ LONG_DISTANCE_NAMES = [
     "Floridian",
 ]
 
-DIRECTION_LABELS = {
-    0: "Westbound / Southbound",
-    1: "Eastbound / Northbound",
-}
-
 # ---- Line styling (day/night) ----
 DAY_LINEWIDTH = 2.6
 NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
 # ---- Labels ----
-ROUTE_LABEL_FONTSIZE = 6.5
-LABEL_OFFSET_DEGREES = 0.35
+ROUTE_LABEL_FONTSIZE = 6.3
 LABEL_HALO_WIDTH = 2.2
+LABEL_OFFSET_DEGREES = 0.28  # how far label sits off the track
+
+# ---- Direction separation ("small gap" between directions) ----
+# This is the perpendicular offset applied to each segment.
+# Increase slightly if you want the two directions more clearly separated.
+DIRECTION_GAP_DEG = 0.11  # ~small; try 0.08–0.16
 
 # ---- Chevrons (unfilled) ----
 CHEVRON_EVERY_N_SEGMENTS = 18
 CHEVRON_SKIP_END_SEGMENTS = 6
-CHEVRON_SIZE_DEG = 0.10       # smaller = tinier
+CHEVRON_SIZE_DEG = 0.085
 CHEVRON_ANGLE_DEG = 24
 CHEVRON_LW_DAY = 0.35
 CHEVRON_LW_NIGHT = 0.28
@@ -103,25 +108,29 @@ def _download_gtfs_zip_bytes(max_age_minutes: int = 60) -> bytes:
 
 
 def _download_states_geojson(max_age_minutes: int = 1440):
+    # cache hit
     now = datetime.utcnow()
     if _STATES_CACHE["geojson"] is not None and _STATES_CACHE["fetched_at"] is not None:
         age = (now - _STATES_CACHE["fetched_at"]).total_seconds() / 60.0
         if age <= max_age_minutes:
             return _STATES_CACHE["geojson"]
 
-    try:
-        r = requests.get(
-            US_STATES_GEOJSON_URL,
-            timeout=60,
-            headers={"User-Agent": "amtrak-map-service/1.0"},
-        )
-        r.raise_for_status()
-        _STATES_CACHE["geojson"] = r.json()
-        _STATES_CACHE["fetched_at"] = now
-        return _STATES_CACHE["geojson"]
-    except Exception as e:
-        print(f"[WARN] Failed to download states basemap: {e}")
-        return {"type": "FeatureCollection", "features": []}
+    # try multiple URLs
+    last_err = None
+    for url in US_STATES_GEOJSON_URLS:
+        try:
+            r = requests.get(url, timeout=60, headers={"User-Agent": "amtrak-map-service/1.0"})
+            r.raise_for_status()
+            gj = r.json()
+            _STATES_CACHE["geojson"] = gj
+            _STATES_CACHE["fetched_at"] = now
+            return gj
+        except Exception as e:
+            last_err = e
+
+    # fail gracefully
+    print(f"[WARN] Failed to download states basemap from all sources: {last_err}")
+    return {"type": "FeatureCollection", "features": []}
 
 
 def _read_txt(z: zipfile.ZipFile, name: str) -> pd.DataFrame:
@@ -159,20 +168,23 @@ def _is_daylight(lat: float, lon: float, tz_name: str, dt_local) -> bool:
     return s["sunrise"] <= dt_local <= s["sunset"]
 
 
-def _perpendicular_offset(x0, y0, x1, y1, distance):
-    dx = x1 - x0
-    dy = y1 - y0
+def _perp_unit(dx, dy):
     length = math.hypot(dx, dy)
     if length == 0:
         return 0.0, 0.0
-    ux = -dy / length
-    uy = dx / length
-    return ux * distance, uy * distance
+    # perpendicular unit vector
+    return (-dy / length, dx / length)
 
 
 def _draw_states_basemap(ax):
     gj = _download_states_geojson()
     feats = gj.get("features", [])
+
+    # Make it visible but subtle
+    line_color = "#000000"
+    lw = 0.7
+    alpha = 0.38
+
     for feat in feats:
         geom = feat.get("geometry", {})
         gtype = geom.get("type")
@@ -181,7 +193,7 @@ def _draw_states_basemap(ax):
         def draw_ring(ring):
             xs = [pt[0] for pt in ring]
             ys = [pt[1] for pt in ring]
-            ax.plot(xs, ys, linewidth=0.6, alpha=0.30, zorder=1, color="black")
+            ax.plot(xs, ys, linewidth=lw, alpha=alpha, zorder=1, color=line_color)
 
         if gtype == "Polygon":
             for ring in coords:
@@ -193,16 +205,12 @@ def _draw_states_basemap(ax):
 
 
 def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
-    """
-    Draw a tiny unfilled chevron centered at (x,y), pointing along heading_rad.
-    """
     lw = CHEVRON_LW_DAY if is_day else CHEVRON_LW_NIGHT
     alpha = CHEVRON_ALPHA_DAY if is_day else CHEVRON_ALPHA_NIGHT
 
     a = math.radians(CHEVRON_ANGLE_DEG)
     s = CHEVRON_SIZE_DEG
 
-    # tip forward, two tails behind at +/- angle
     tip_x = x + math.cos(heading_rad) * (s * 0.35)
     tip_y = y + math.sin(heading_rad) * (s * 0.35)
 
@@ -263,27 +271,55 @@ def _load_representative_trips(run_date: date):
     return reps, stop_times, stops
 
 
-def _setup_axes(ax, panel_title: str):
-    ax.set_title(panel_title, fontsize=12)
+def _make_single_map_two_directions(run_date: date):
+    """
+    ONE map, but each route is drawn as a paired track:
+    direction 0 is offset to one side, direction 1 to the other, leaving a small gap.
+    """
+    reps, stop_times, stops = _load_representative_trips(run_date)
+
+    fig, ax = plt.subplots(figsize=(18, 10))
+    ax.set_title(f"Amtrak Long-Distance Routes — Both Directions (separated)\nDaylight vs Darkness — {run_date}", fontsize=14)
+
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
+
+    # Basemap
     _draw_states_basemap(ax)
-    ax.grid(True, linewidth=0.3, alpha=0.20)
 
+    # Legends
+    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
+    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
+    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
 
-def _draw_direction_on_ax(ax, run_date: date, direction: int, reps, stop_times, stops):
+    ax.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
+    key = ax.legend(
+        handles=legend_routes,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.00),
+        borderaxespad=0.0,
+        fontsize=8,
+        frameon=False,
+        title="Train services",
+        title_fontsize=9,
+        ncol=1,
+    )
+    ax.add_artist(key)
+
+    # Draw both directions, offset per segment
     for name, dir_id, trip_id in reps:
-        if dir_id != direction:
-            continue
-
         colour = ROUTE_COLOURS.get(name, "#000000")
 
         st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
         st = st.dropna(subset=["stop_lat", "stop_lon", "dep_sec", "arr_sec", "stop_timezone"])
         if len(st) < 2:
             continue
+
+        # dir sign controls which side of the "centerline" this direction sits
+        # (0 -> one side, 1 -> other side)
+        sign = -1.0 if dir_id == 0 else 1.0
 
         nseg = len(st) - 1
 
@@ -312,9 +348,20 @@ def _draw_direction_on_ax(ax, run_date: date, direction: int, reps, stop_times, 
             x0, y0 = float(a["stop_lon"]), float(a["stop_lat"])
             x1, y1 = float(b["stop_lon"]), float(b["stop_lat"])
 
+            dx = x1 - x0
+            dy = y1 - y0
+            ux, uy = _perp_unit(dx, dy)
+
+            # apply perpendicular offset so the two directions sit side-by-side
+            offx = ux * DIRECTION_GAP_DEG * sign
+            offy = uy * DIRECTION_GAP_DEG * sign
+
+            xs = [x0 + offx, x1 + offx]
+            ys = [y0 + offy, y1 + offy]
+
             ax.plot(
-                [x0, x1],
-                [y0, y1],
+                xs,
+                ys,
                 color=colour,
                 linewidth=DAY_LINEWIDTH if daylight else NIGHT_LINEWIDTH,
                 linestyle="-" if daylight else "--",
@@ -322,31 +369,38 @@ def _draw_direction_on_ax(ax, run_date: date, direction: int, reps, stop_times, 
                 zorder=5,
             )
 
-            # chevrons (skip near route ends)
+            # chevrons (skip near ends)
             near_start = i < CHEVRON_SKIP_END_SEGMENTS
             near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
             if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
-                xc = x0 + (x1 - x0) * 0.50
-                yc = y0 + (y1 - y0) * 0.50
-                heading = math.atan2((y1 - y0), (x1 - x0))
+                xc = (x0 + x1) / 2.0 + offx
+                yc = (y0 + y1) / 2.0 + offy
+                heading = math.atan2(dy, dx)
                 _draw_chevron(ax, xc, yc, heading, colour, daylight)
 
-        # label near midpoint, offset perpendicular to avoid overlap
+        # label near midpoint, offset away from the *directional* track
         mid = len(st) // 2
         a = st.iloc[mid - 1]
         b = st.iloc[mid]
-        x_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
-        y_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
+        x0, y0 = float(a["stop_lon"]), float(a["stop_lat"])
+        x1, y1 = float(b["stop_lon"]), float(b["stop_lat"])
 
-        dx, dy = _perpendicular_offset(
-            float(a["stop_lon"]), float(a["stop_lat"]),
-            float(b["stop_lon"]), float(b["stop_lat"]),
-            LABEL_OFFSET_DEGREES
-        )
+        dx = x1 - x0
+        dy = y1 - y0
+        ux, uy = _perp_unit(dx, dy)
+
+        # place label slightly further out than the track offset so it doesn't overlap
+        track_offx = ux * DIRECTION_GAP_DEG * sign
+        track_offy = uy * DIRECTION_GAP_DEG * sign
+        label_offx = ux * (DIRECTION_GAP_DEG * sign + LABEL_OFFSET_DEGREES * sign)
+        label_offy = uy * (DIRECTION_GAP_DEG * sign + LABEL_OFFSET_DEGREES * sign)
+
+        xm = (x0 + x1) / 2.0 + label_offx
+        ym = (y0 + y1) / 2.0 + label_offy
 
         ax.text(
-            x_mid + dx,
-            y_mid + dy,
+            xm,
+            ym,
             name,
             fontsize=ROUTE_LABEL_FONTSIZE,
             weight="bold",
@@ -357,46 +411,15 @@ def _draw_direction_on_ax(ax, run_date: date, direction: int, reps, stop_times, 
             path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
         )
 
+    ax.grid(True, linewidth=0.3, alpha=0.20)
 
-def _make_side_by_side_figure(run_date: date):
-    reps, stop_times, stops = _load_representative_trips(run_date)
-
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(20, 9))
-    fig.suptitle(f"Amtrak Long-Distance Routes — Daylight vs Darkness — {run_date}", fontsize=14)
-
-    _setup_axes(ax_left, DIRECTION_LABELS[0])
-    _setup_axes(ax_right, DIRECTION_LABELS[1])
-
-    _draw_direction_on_ax(ax_left, run_date, 0, reps, stop_times, stops)
-    _draw_direction_on_ax(ax_right, run_date, 1, reps, stop_times, stops)
-
-    # Legends (one shared legend on the right side)
-    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
-    night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
-
-    # day/night legend under left panel
-    ax_left.legend(handles=[day_leg, night_leg], loc="lower left", fontsize=8, frameon=False)
-
-    # route key to the far right of the whole figure
-    fig.legend(
-        handles=legend_routes,
-        loc="upper left",
-        bbox_to_anchor=(0.86, 0.92),
-        fontsize=8,
-        frameon=False,
-        title="Train services",
-        title_fontsize=9,
-        ncol=1,
-    )
-
-    # make room for the legend area on the right
-    fig.tight_layout(rect=[0.0, 0.0, 0.85, 0.93])
+    # room on right for legend
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     return fig
 
 
 def build_png_bytes(run_date: date) -> bytes:
-    fig = _make_side_by_side_figure(run_date)
+    fig = _make_single_map_two_directions(run_date)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=170)
     plt.close(fig)
@@ -407,7 +430,7 @@ def build_png_bytes(run_date: date) -> bytes:
 def build_pdf_bytes(run_date: date) -> bytes:
     out = io.BytesIO()
     with PdfPages(out) as pdf:
-        fig = _make_side_by_side_figure(run_date)
+        fig = _make_single_map_two_directions(run_date)
         pdf.savefig(fig)
         plt.close(fig)
     out.seek(0)
