@@ -157,15 +157,16 @@ STATION_MARKERS = [
 
 # --- Scenic points of interest (same text style & size as trigraphs) ---
 # Keep these relatively sparse to avoid clutter.
+# Format: (label, lon, lat, dx, dy) where dx/dy are small nudges in degrees
 SCENIC_POIS = [
-    ("GLACIER NP", -113.8, 48.7),
-    ("MARIAS PASS", -113.3, 48.3),
-    ("COLUMBIA R.", -120.0, 46.1),
-    ("ROCKY MTNS", -106.5, 39.4),
-    ("GLENWOOD\nCANYON", -107.2, 39.6),
-    ("RATON PASS", -105.2, 36.9),
-    ("SANTA FE", -105.94, 35.69),
-    ("MISSISSIPPI", -90.2, 35.1),
+    ("GLACIER NP",    -113.80, 48.70,  0.40,  0.20),
+    ("MARIAS PASS",   -113.30, 48.30,  0.35, -0.20),
+    ("COLUMBIA R.",   -120.00, 46.10, -0.35,  0.20),
+    ("ROCKY MTNS",    -106.50, 39.40,  0.45,  0.25),
+    ("GLENWOOD\nCANYON", -107.20, 39.60, -0.45, 0.10),
+    ("RATON PASS",    -105.20, 36.90,  0.45, -0.25),
+    ("SANTA FE",      -105.94, 35.69,  0.55,  0.10),
+    ("MISSISSIPPI",   -90.20,  35.10,  0.55, -0.10),
 ]
 
 # --- Draw ONLY a sub-segment of a route ---
@@ -304,8 +305,8 @@ def _draw_station_labels(ax):
 
 
 def _draw_scenic_pois(ax):
-    for label, lon, lat in SCENIC_POIS:
-        _draw_text_label(ax, label, lon, lat)
+    for label, lon, lat, dx, dy in SCENIC_POIS:
+        _draw_text_label(ax, label, lon + dx, lat + dy)
 
 
 def _map_seg_index(i, nseg_geom, nseg_time):
