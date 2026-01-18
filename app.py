@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# Sunset Limited is back, but we'll draw ONLY the NOL <-> SAS portion (see SUBSEGMENT_LIMITS below).
+# Sunset Limited is shown only on the NOL <-> SAS portion (see SUBSEGMENT_LIMITS below).
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -55,11 +55,11 @@ NIGHT_ALPHA = 0.55
 # ---- Parallel separation ----
 PARALLEL_GAP_DEG = 0.17
 
-# ---- Station label styling ----
-STATION_FONTSIZE = 7.0
-STATION_HALO_WIDTH = 2.6
+# ---- Label styling (used for station trigraphs + POIs) ----
+LABEL_FONTSIZE = 7.0
+LABEL_HALO_WIDTH = 2.6
 
-# ---- Chevrons (night-only) ----
+# ---- Chevrons (night-only, to improve visibility) ----
 CHEVRON_EVERY_N_SEGMENTS = 10
 CHEVRON_SKIP_END_SEGMENTS = 3
 CHEVRON_SIZE_DEG = 0.36
@@ -67,6 +67,13 @@ CHEVRON_ANGLE_DEG = 24
 CHEVRON_LW_NIGHT = 1.05
 CHEVRON_ALPHA_NIGHT = 0.90
 CHEVRON_ZORDER = 10
+
+# ---- Improve daylight/darkness accuracy ----
+# 1) Use CIVIL TWILIGHT: "light" means dawn -> dusk (Astral's civil twilight times).
+# 2) Sample multiple points along each segment and classify by majority vote
+#    (this helps on long legs crossing timezones/latitudes/mountains).
+LIGHT_SAMPLE_POINTS_PER_SEGMENT = 5  # 3..7 is reasonable; 5 is a good balance for Render
+LIGHT_MAJORITY_THRESHOLD = 0.5       # > 0.5 means "mostly light" across sampled points
 
 # ---- Fixed colours ----
 HEX_PALETTE = [
@@ -79,13 +86,7 @@ ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerat
 
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
 
-# --- Trigraph markers (expanded) ---
-# Note: these are approximate city/station-area coordinates used only for labels.
-# Added lots more interim points for:
-#  - Empire Builder
-#  - Texas Eagle
-#  - Southwest Chief
-#  - +2 more for California Zephyr
+# --- Trigraph markers (FTW removed as requested) ---
 STATION_MARKERS = [
     # West Coast / PNW
     ("SEA", -122.3301, 47.6038),
@@ -95,7 +96,7 @@ STATION_MARKERS = [
     ("VAN", -122.6615, 45.6387),
     ("SPK", -117.4260, 47.6588),
 
-    # Northern tier / Empire Builder interim (>=4 more)
+    # Empire Builder interim
     ("MSP", -93.2650, 44.9778),
     ("STP", -93.0899, 44.9537),
     ("FAR", -96.7898, 46.8772),
@@ -115,32 +116,29 @@ STATION_MARKERS = [
     ("LAX", -118.2437, 34.0522),
     ("SAN", -117.1611, 32.7157),
 
-    # California Zephyr extra interim (+2 more)
+    # California Zephyr interim
     ("DEN", -104.9903, 39.7392),
     ("GJT", -108.5506, 39.0639),
-    ("GLN", -107.3248, 39.5505),  # Glenwood Springs-ish
-    ("SLC", -111.8910, 40.7608),  # not Zephyr, but useful ref
-    ("OMA", -95.9345, 41.2565),   # reference
+    ("GLN", -107.3248, 39.5505),
     ("CHI", -87.6300, 41.8819),
 
-    # Southwest Chief interim (>=4 more)
-    ("GBB", -90.3712, 40.9478),   # Galesburg-ish
-    ("KCY", -94.5786, 39.0997),   # Kansas City-ish
-    ("NEW", -97.3450, 38.0354),   # Newton, KS-ish
-    ("DDG", -100.0171, 37.7528),  # Dodge City-ish
-    ("LAM", -103.5438, 37.9850),  # La Junta-ish
+    # Southwest Chief interim
+    ("GBB", -90.3712, 40.9478),
+    ("KCY", -94.5786, 39.0997),
+    ("NEW", -97.3450, 38.0354),
+    ("DDG", -100.0171, 37.7528),
+    ("LAM", -103.5438, 37.9850),
     ("ABQ", -106.6504, 35.0844),
-    ("GUP", -108.7426, 35.5281),  # Gallup-ish
-    ("FLG", -111.6513, 35.1983),  # Flagstaff-ish
+    ("GUP", -108.7426, 35.5281),
+    ("FLG", -111.6513, 35.1983),
 
-    # Texas Eagle interim (>=4 more)
-    ("SPI", -89.6501, 39.8017),   # Springfield, IL-ish
+    # Texas Eagle interim (FTW removed)
+    ("SPI", -89.6501, 39.8017),
     ("STL", -90.1994, 38.6270),
-    ("LRK", -92.2896, 34.7465),   # Little Rock-ish
-    ("DAL", -96.7970, 32.7767),   # Dallas-ish
-    ("FTW", -97.3308, 32.7555),   # Fort Worth-ish
-    ("AUS", -97.7431, 30.2672),   # Austin-ish
-    ("SAS", -98.4936, 29.4241),   # San Antonio-ish
+    ("LRK", -92.2896, 34.7465),
+    ("DAL", -96.7970, 32.7767),
+    ("AUS", -97.7431, 30.2672),
+    ("SAS", -98.4936, 29.4241),
 
     # South / East
     ("NOL", -90.0715, 29.9511),
@@ -157,7 +155,20 @@ STATION_MARKERS = [
     ("ALB", -73.7562, 42.6526),
 ]
 
-# --- Draw ONLY a sub-segment of a route (to avoid clashes) ---
+# --- Scenic points of interest (same text style & size as trigraphs) ---
+# Keep these relatively sparse to avoid clutter.
+SCENIC_POIS = [
+    ("GLACIER NP", -113.8, 48.7),
+    ("MARIAS PASS", -113.3, 48.3),
+    ("COLUMBIA R.", -120.0, 46.1),
+    ("ROCKY MTNS", -106.5, 39.4),
+    ("GLENWOOD\nCANYON", -107.2, 39.6),
+    ("RATON PASS", -105.2, 36.9),
+    ("SANTA FE", -105.94, 35.69),
+    ("MISSISSIPPI", -90.2, 35.1),
+]
+
+# --- Draw ONLY a sub-segment of a route ---
 # Sunset Limited: keep only New Orleans <-> San Antonio
 SUBSEGMENT_LIMITS = {
     "Sunset Limited": (("NOL", -90.0715, 29.9511), ("SAS", -98.4936, 29.4241)),
@@ -204,14 +215,20 @@ def _service_active_on(row, yyyymmdd: str) -> bool:
     return int(row[cols[weekday]]) == 1
 
 
-def _sun_times(lat: float, lon: float, tz_name: str, on_date: date):
+def _sun_civil_times(lat: float, lon: float, tz_name: str, on_date: date):
+    """
+    CIVIL TWILIGHT:
+      - dawn: start of civil twilight (AM)
+      - dusk: end of civil twilight (PM)
+    We'll treat "light" as [dawn, dusk].
+    """
     try:
         tz = pytz.timezone(tz_name)
     except Exception:
         tz = pytz.UTC
     loc = LocationInfo(latitude=lat, longitude=lon, timezone=getattr(tz, "zone", "UTC"))
     s = sun(loc.observer, date=on_date, tzinfo=tz)
-    return s["sunrise"], s["sunset"]
+    return s["dawn"], s["dusk"]
 
 
 def _perp_unit(dx, dy):
@@ -266,20 +283,29 @@ def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
     ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
 
 
+def _draw_text_label(ax, text, lon, lat):
+    ax.text(
+        lon, lat, text,
+        fontsize=LABEL_FONTSIZE,
+        ha="center", va="center",
+        color="black",
+        zorder=20,
+        path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
+    )
+
+
 def _draw_station_labels(ax):
     seen = set()
     for code, lon, lat in STATION_MARKERS:
         if code in seen:
             continue
         seen.add(code)
-        ax.text(
-            lon, lat, code,
-            fontsize=STATION_FONTSIZE,
-            ha="center", va="center",
-            color="black",
-            zorder=20,
-            path_effects=[pe.withStroke(linewidth=STATION_HALO_WIDTH, foreground="white")],
-        )
+        _draw_text_label(ax, code, lon, lat)
+
+
+def _draw_scenic_pois(ax):
+    for label, lon, lat in SCENIC_POIS:
+        _draw_text_label(ax, label, lon, lat)
 
 
 def _map_seg_index(i, nseg_geom, nseg_time):
@@ -378,7 +404,6 @@ def _load_trips_and_stops(run_date: date):
 
 
 def _nearest_index_by_coord(st_df: pd.DataFrame, lon: float, lat: float) -> int:
-    # st_df must contain stop_lon/stop_lat
     lons = st_df["stop_lon"].astype(float).to_numpy()
     lats = st_df["stop_lat"].astype(float).to_numpy()
     d2 = (lons - lon) ** 2 + (lats - lat) ** 2
@@ -386,9 +411,6 @@ def _nearest_index_by_coord(st_df: pd.DataFrame, lon: float, lat: float) -> int:
 
 
 def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If a route has a subsegment limit, slice the stop sequence between the two nearest endpoints.
-    """
     if route_name not in SUBSEGMENT_LIMITS:
         return st_df
 
@@ -404,12 +426,58 @@ def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.Data
     return sliced if len(sliced) >= 2 else st_df
 
 
+def _classify_light_civil_with_sampling(run_date: date, origin_dt_local, origin_dep_sec: int,
+                                        a_row, b_row, tz_name_here: str) -> bool:
+    """
+    Improved classification:
+      - Use CIVIL twilight (dawn->dusk) rather than sunrise->sunset.
+      - Sample multiple points in time+space along the segment and majority-vote.
+    """
+    try:
+        tz_here = pytz.timezone(tz_name_here)
+    except Exception:
+        tz_here = pytz.UTC
+
+    # times in "seconds since midnight" of the trip's stop_times
+    t0 = int(a_row["dep_sec"])
+    t1 = int(b_row["arr_sec"])
+    if t1 < t0:
+        # overnight wrap in GTFS can happen if not using >24:00 times consistently;
+        # as a simple guard, push arrival forward by 24h
+        t1 = t1 + 24 * 3600
+
+    lat0 = float(a_row["stop_lat"])
+    lon0 = float(a_row["stop_lon"])
+    lat1 = float(b_row["stop_lat"])
+    lon1 = float(b_row["stop_lon"])
+
+    n = max(3, int(LIGHT_SAMPLE_POINTS_PER_SEGMENT))
+    votes = 0
+    for k in range(n):
+        f = k / (n - 1) if n > 1 else 0.5
+        t = int(round(t0 + (t1 - t0) * f))
+
+        # convert t into a localized datetime by anchoring to origin departure
+        delta_from_origin = t - origin_dep_sec
+        dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
+        dt_here = dt_at_origin.astimezone(tz_here)
+
+        lat = lat0 + (lat1 - lat0) * f
+        lon = lon0 + (lon1 - lon0) * f
+
+        dawn, dusk = _sun_civil_times(lat, lon, tz_name_here, dt_here.date())
+        is_light = (dawn <= dt_here <= dusk)
+        votes += 1 if is_light else 0
+
+    return (votes / n) > LIGHT_MAJORITY_THRESHOLD
+
+
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
 
     fig, ax = plt.subplots(figsize=(18, 10))
     ax.set_title(
-        f"Amtrak Long-Distance Routes\nDaylight vs Darkness — {run_date}",
+        f"Amtrak Long-Distance Routes\nCivil Twilight (dawn→dusk) — {run_date}",
         fontsize=14,
     )
     ax.set_xlim(-125, -66)
@@ -420,8 +488,8 @@ def _make_map(run_date: date):
 
     # Day/Night style legend (lower left)
     style_handles = [
-        mlines.Line2D([], [], color="black", lw=DAY_LINEWIDTH, linestyle="-", label="Daylight"),
-        mlines.Line2D([], [], color="black", lw=NIGHT_LINEWIDTH, linestyle="--", alpha=NIGHT_ALPHA, label="Darkness"),
+        mlines.Line2D([], [], color="black", lw=DAY_LINEWIDTH, linestyle="-", label="Light (civil twilight)"),
+        mlines.Line2D([], [], color="black", lw=NIGHT_LINEWIDTH, linestyle="--", alpha=NIGHT_ALPHA, label="Dark"),
     ]
     style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=True)
     ax.add_artist(style_leg)
@@ -439,6 +507,7 @@ def _make_map(run_date: date):
     ax.add_artist(route_leg)
 
     _draw_station_labels(ax)
+    _draw_scenic_pois(ax)
 
     for name in LONG_DISTANCE_NAMES:
         if name not in routes_branches:
@@ -459,7 +528,6 @@ def _make_map(run_date: date):
             st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
             st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
 
-            # If we only want a portion (Sunset Limited NOL<->SAS), slice here
             st_geom = _apply_subsegment_if_needed(name, st_geom)
             if len(st_geom) < 2:
                 continue
@@ -481,8 +549,6 @@ def _make_map(run_date: date):
 
                 st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
                 st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"]).sort_values("stop_sequence")
-
-                # Slice timings the same way for subsegment routes
                 st_time = _apply_subsegment_if_needed(name, st_time)
                 if len(st_time) < 2:
                     continue
@@ -504,27 +570,15 @@ def _make_map(run_date: date):
                     a = st_time.iloc[j]
                     b = st_time.iloc[min(j + 1, len(st_time) - 1)]
 
-                    t0 = a["dep_sec"]
-                    t1 = b["arr_sec"]
-                    if t0 is None or t1 is None:
+                    if a["dep_sec"] is None or b["arr_sec"] is None:
                         continue
 
-                    mid_sec = int((int(t0) + int(t1)) / 2)
-                    delta_from_origin = mid_sec - origin_dep_sec
-                    dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
-
                     tz_name_here = a["stop_timezone"]
-                    try:
-                        tz_here = pytz.timezone(tz_name_here)
-                    except Exception:
-                        tz_here = pytz.UTC
-                    dt_here = dt_at_origin.astimezone(tz_here)
 
-                    lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
-                    lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
-
-                    sunrise, sunset = _sun_times(lat_mid, lon_mid, tz_name_here, dt_here.date())
-                    daylight = sunrise <= dt_here <= sunset
+                    # Civil twilight + sampling for improved accuracy
+                    is_light = _classify_light_civil_with_sampling(
+                        run_date, origin_dt_local, origin_dep_sec, a, b, tz_name_here
+                    )
 
                     x0, y0 = xs[i], ys[i]
                     x1, y1 = xs[i + 1], ys[i + 1]
@@ -533,14 +587,14 @@ def _make_map(run_date: date):
                         [x0, x1],
                         [y0, y1],
                         color=colour,
-                        linewidth=DAY_LINEWIDTH if daylight else NIGHT_LINEWIDTH,
-                        linestyle="-" if daylight else "--",
-                        alpha=1.0 if daylight else NIGHT_ALPHA,
+                        linewidth=DAY_LINEWIDTH if is_light else NIGHT_LINEWIDTH,
+                        linestyle="-" if is_light else "--",
+                        alpha=1.0 if is_light else NIGHT_ALPHA,
                         zorder=5,
                     )
 
                     # Chevrons NIGHT ONLY + keep away from ends
-                    if not daylight:
+                    if not is_light:
                         near_start = i < CHEVRON_SKIP_END_SEGMENTS
                         near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
                         if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
