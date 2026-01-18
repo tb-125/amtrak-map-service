@@ -50,23 +50,24 @@ DAY_LINEWIDTH = 2.6
 NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
-# ---- Parallel separation (50% closer than 0.34) ----
-PARALLEL_GAP_DEG = 0.17
+# ---- Parallel separation ----
+PARALLEL_GAP_DEG = 0.17  # 50% closer than 0.34
 
 # ---- Labels ----
 ROUTE_LABEL_FONTSIZE = 6.5
 LABEL_HALO_WIDTH = 2.2
-LABEL_OUTWARD_EXTRA_DEG = 0.20  # pushes label away from its track a bit
+LABEL_OUTWARD_EXTRA_DEG = 0.20
 
-# ---- Chevrons (unfilled) ----
-CHEVRON_EVERY_N_SEGMENTS = 18
-CHEVRON_SKIP_END_SEGMENTS = 6
-CHEVRON_SIZE_DEG = 0.085
+# ---- Chevrons (make them clearly visible) ----
+CHEVRON_EVERY_N_SEGMENTS = 10          # more frequent
+CHEVRON_SKIP_END_SEGMENTS = 3          # fewer skipped
+CHEVRON_SIZE_DEG = 0.13                # bigger
 CHEVRON_ANGLE_DEG = 24
-CHEVRON_LW_DAY = 0.35
-CHEVRON_LW_NIGHT = 0.28
-CHEVRON_ALPHA_DAY = 0.55
-CHEVRON_ALPHA_NIGHT = 0.35
+CHEVRON_LW_DAY = 0.90                  # thicker
+CHEVRON_LW_NIGHT = 0.75
+CHEVRON_ALPHA_DAY = 0.95               # more opaque
+CHEVRON_ALPHA_NIGHT = 0.70
+CHEVRON_ZORDER = 10
 
 # ---- Fixed colours ----
 HEX_PALETTE = [
@@ -103,6 +104,9 @@ def _read_txt(z: zipfile.ZipFile, name: str) -> pd.DataFrame:
 
 
 def _parse_gtfs_time(t):
+    """
+    GTFS times can exceed 24:00:00. Keep as seconds since service-day midnight.
+    """
     if pd.isna(t) or not isinstance(t, str) or not t.strip():
         return None
     h, m, s = t.split(":")
@@ -120,16 +124,19 @@ def _service_active_on(row, yyyymmdd: str) -> bool:
     return int(row[cols[weekday]]) == 1
 
 
-def _is_daylight(lat: float, lon: float, tz_name: str, dt_local) -> bool:
+def _sun_times(lat: float, lon: float, tz_name: str, on_date: date):
     try:
         tz = pytz.timezone(tz_name)
     except Exception:
         tz = pytz.UTC
     loc = LocationInfo(latitude=lat, longitude=lon, timezone=getattr(tz, "zone", "UTC"))
-    if dt_local.tzinfo is None:
-        dt_local = tz.localize(dt_local)
-    s = sun(loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
-    return s["sunrise"] <= dt_local <= s["sunset"]
+    s = sun(loc.observer, date=on_date, tzinfo=tz)
+    return s["sunrise"], s["sunset"]
+
+
+def _is_daylight_at(lat: float, lon: float, tz_name: str, dt_local) -> bool:
+    sunrise, sunset = _sun_times(lat, lon, tz_name, dt_local.date())
+    return sunrise <= dt_local <= sunset
 
 
 def _perp_unit(dx, dy):
@@ -141,7 +148,7 @@ def _perp_unit(dx, dy):
 
 def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
     """
-    Smooth "track-like" offset polyline using a local tangent per vertex.
+    Smooth offset polyline using a local tangent per vertex.
     """
     n = len(lons)
     if n < 2:
@@ -186,8 +193,8 @@ def _draw_chevron(ax, x, y, heading_rad, colour, is_day: bool):
     right_x = tip_x + math.cos(right_dir) * (s * 0.85)
     right_y = tip_y + math.sin(right_dir) * (s * 0.85)
 
-    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=6)
-    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=6)
+    ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
+    ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=lw, alpha=alpha, zorder=CHEVRON_ZORDER)
 
 
 def _load_trips(run_date: date):
@@ -205,7 +212,6 @@ def _load_trips(run_date: date):
     calendar = _read_txt(z, "calendar.txt")
 
     yyyymmdd = run_date.strftime("%Y%m%d")
-
     active_services = {
         row["service_id"]
         for _, row in calendar.iterrows()
@@ -245,10 +251,37 @@ def _map_seg_index(i, nseg_geom, nseg_time):
     return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
 
 
+def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
+    """
+    Anchor the trip to its FIRST departure time in its FIRST stop timezone.
+    This greatly improves daylight correctness vs treating all times as from midnight everywhere.
+    """
+    if len(st_time) == 0:
+        return None, None, None
+
+    first = st_time.iloc[0]
+    origin_tz = first["stop_timezone"]
+    origin_dep_sec = first["dep_sec"]
+    if origin_dep_sec is None or pd.isna(origin_dep_sec):
+        # fallback: use arr_sec
+        origin_dep_sec = first["arr_sec"]
+
+    try:
+        tz = pytz.timezone(origin_tz)
+    except Exception:
+        tz = pytz.UTC
+
+    # Service day "run_date" is taken as the origin service day in origin timezone
+    origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
+
+    return origin_dt_local, tz, int(origin_dep_sec)
+
+
 def _make_map(run_date: date):
     """
-    One map. For each service, take a single "centerline" and draw two parallel tracks around it.
-    Direction 0 uses its own schedule for daylight/dark. Direction 1 uses its own schedule and is drawn reversed.
+    One map. For each service, draw two parallel tracks.
+    Each track uses its OWN trip timing anchored to origin departure -> better daylight accuracy.
+    Direction 1 is drawn reversed so the chevrons point opposite.
     """
     reps, stop_times, stops = _load_trips(run_date)
 
@@ -263,7 +296,6 @@ def _make_map(run_date: date):
     ax.set_ylabel("Latitude")
     ax.grid(True, linewidth=0.3, alpha=0.20)
 
-    # legends
     legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
     day_leg = mlines.Line2D([], [], color="black", lw=3, label="Daylight (solid)")
     night_leg = mlines.Line2D([], [], color="black", lw=1.2, linestyle="--", label="Darkness (dashed)")
@@ -285,8 +317,6 @@ def _make_map(run_date: date):
     for name in LONG_DISTANCE_NAMES:
         trip0 = reps.get((name, 0))
         trip1 = reps.get((name, 1))
-
-        # Pick a geometry-defining trip (prefer whichever exists)
         center_trip = trip0 or trip1
         if not center_trip:
             continue
@@ -312,24 +342,28 @@ def _make_map(run_date: date):
         ]
 
         for direction_id, xs, ys, dir_trip in dir_tracks:
-            # Load direction-specific timing+position if we have it, else fallback to geometry trip
-            if dir_trip:
-                st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
-                st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"])
-                st_time = st_time.sort_values("stop_sequence")
-            else:
-                st_time = st_geom.copy()
-                st_time["dep_sec"] = stop_times[stop_times["trip_id"] == center_trip]["dep_sec"].values[: len(st_time)]
-                st_time["arr_sec"] = stop_times[stop_times["trip_id"] == center_trip]["arr_sec"].values[: len(st_time)]
+            if not dir_trip:
+                # If a direction is missing in GTFS for this date, skip that track
+                continue
 
-            # Reverse geometry for direction 1 so chevrons and progression are opposite
+            st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
+            st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"])
+            st_time = st_time.sort_values("stop_sequence")
+            if len(st_time) < 2:
+                continue
+
+            origin_dt_local, origin_tz, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
+            if origin_dt_local is None:
+                continue
+
+            # Reverse geometry for direction 1 so chevrons/progression are opposite
             if direction_id == 1:
                 xs = list(reversed(xs))
                 ys = list(reversed(ys))
 
             nseg = len(xs) - 1
             nseg_time = len(st_time) - 1
-            if nseg <= 0:
+            if nseg <= 0 or nseg_time <= 0:
                 continue
 
             for i in range(nseg):
@@ -342,18 +376,23 @@ def _make_map(run_date: date):
                 if t0 is None or t1 is None:
                     continue
 
-                mid_sec = int((t0 + t1) / 2)
-                dt_naive = datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=mid_sec)
+                mid_sec = int((int(t0) + int(t1)) / 2)
 
-                tz_name = a["stop_timezone"]
+                # Compute absolute datetime by offset from origin departure, then convert to local tz at this segment
+                delta_from_origin = mid_sec - origin_dep_sec
+                dt_at_origin = origin_dt_local + timedelta(seconds=delta_from_origin)
+
+                tz_name_here = a["stop_timezone"]
                 try:
-                    dt_local = pytz.timezone(tz_name).localize(dt_naive)
+                    tz_here = pytz.timezone(tz_name_here)
                 except Exception:
-                    dt_local = pytz.UTC.localize(dt_naive)
+                    tz_here = pytz.UTC
+
+                dt_here = dt_at_origin.astimezone(tz_here)
 
                 lat_mid = (float(a["stop_lat"]) + float(b["stop_lat"])) / 2.0
                 lon_mid = (float(a["stop_lon"]) + float(b["stop_lon"])) / 2.0
-                daylight = _is_daylight(lat_mid, lon_mid, tz_name, dt_local)
+                daylight = _is_daylight_at(lat_mid, lon_mid, tz_name_here, dt_here)
 
                 x0, y0 = xs[i], ys[i]
                 x1, y1 = xs[i + 1], ys[i + 1]
@@ -368,14 +407,14 @@ def _make_map(run_date: date):
                     zorder=5,
                 )
 
-                if dir_trip:
-                    near_start = i < CHEVRON_SKIP_END_SEGMENTS
-                    near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
-                    if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
-                        heading = math.atan2((y1 - y0), (x1 - x0))
-                        _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
+                # Chevrons
+                near_start = i < CHEVRON_SKIP_END_SEGMENTS
+                near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
+                if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
+                    heading = math.atan2((y1 - y0), (x1 - x0))
+                    _draw_chevron(ax, (x0 + x1) / 2.0, (y0 + y1) / 2.0, heading, colour, daylight)
 
-            # One label per direction track, offset outward
+            # Label once per direction track, offset outward
             mid = len(xs) // 2
             i0 = max(0, mid - 1)
             i1 = min(len(xs) - 1, mid)
