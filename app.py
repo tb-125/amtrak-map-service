@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# Sunset Limited removed to avoid confusion
+# Sunset Limited is back, but we'll draw ONLY the NOL <-> SAS portion (see SUBSEGMENT_LIMITS below).
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -40,6 +40,7 @@ LONG_DISTANCE_NAMES = [
     "Empire Builder",
     "Lake Shore Limited",
     "Southwest Chief",
+    "Sunset Limited",
     "Texas Eagle",
     "Silver Meteor",
     "Palmetto",
@@ -57,52 +58,6 @@ PARALLEL_GAP_DEG = 0.17
 # ---- Station label styling ----
 STATION_FONTSIZE = 7.0
 STATION_HALO_WIDTH = 2.6
-
-# Curated station trigraphs + approximate coordinates.
-# Includes extra "interim" points on main east-west routes (Zephyr / Chief / Builder / LSL).
-STATION_MARKERS = [
-    # West Coast / California
-    ("SEA", -122.3301, 47.6038),
-    ("PDX", -122.6765, 45.5231),
-    ("SPK", -117.4260, 47.6588),
-    ("SAC", -121.4944, 38.5816),
-    ("RNO", -119.8138, 39.5296),
-    ("EMY", -122.2920, 37.8400),
-    ("SJC", -121.9010, 37.3290),
-    ("LAX", -118.2437, 34.0522),
-    ("SAN", -117.1611, 32.7157),
-
-    # Rockies / Southwest
-    ("GJT", -108.5506, 39.0639),   # Grand Junction-ish
-    ("DEN", -104.9903, 39.7392),
-    ("SLC", -111.8910, 40.7608),
-    ("ABQ", -106.6504, 35.0844),
-
-    # Plains / Midwest (east-west corridors)
-    ("KCY", -94.5786, 39.0997),    # Kansas City-ish
-    ("OMA", -95.9345, 41.2565),    # Omaha-ish (useful reference even if not on every route)
-    ("MSP", -93.2650, 44.9778),
-    ("FAR", -96.7898, 46.8772),    # Fargo-ish
-
-    # Glacier / Northern corridor
-    ("GPK", -113.9980, 48.4210),   # West Glacier / Glacier Park-ish
-
-    # Great Lakes / Northeast
-    ("CHI", -87.6300, 41.8819),
-    ("STL", -90.1994, 38.6270),
-    ("CLE", -81.6944, 41.4993),
-    ("BUF", -78.8784, 42.8864),
-    ("ALB", -73.7562, 42.6526),
-    ("NYP", -73.9940, 40.7527),
-    ("BOS", -71.0589, 42.3601),
-    ("PHL", -75.1652, 39.9526),
-    ("WAS", -77.0067, 38.8977),
-
-    # South / East
-    ("NOL", -90.0715, 29.9511),
-    ("ATL", -84.3880, 33.7490),
-    ("MIA", -80.1918, 25.7617),
-]
 
 # ---- Chevrons (night-only) ----
 CHEVRON_EVERY_N_SEGMENTS = 10
@@ -123,6 +78,90 @@ HEX_PALETTE = [
 ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
 
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
+
+# --- Trigraph markers (expanded) ---
+# Note: these are approximate city/station-area coordinates used only for labels.
+# Added lots more interim points for:
+#  - Empire Builder
+#  - Texas Eagle
+#  - Southwest Chief
+#  - +2 more for California Zephyr
+STATION_MARKERS = [
+    # West Coast / PNW
+    ("SEA", -122.3301, 47.6038),
+    ("TAC", -122.4443, 47.2529),
+    ("OLY", -122.9007, 47.0379),
+    ("PDX", -122.6765, 45.5231),
+    ("VAN", -122.6615, 45.6387),
+    ("SPK", -117.4260, 47.6588),
+
+    # Northern tier / Empire Builder interim (>=4 more)
+    ("MSP", -93.2650, 44.9778),
+    ("STP", -93.0899, 44.9537),
+    ("FAR", -96.7898, 46.8772),
+    ("GFK", -97.0329, 47.9253),
+    ("MOT", -101.2963, 48.2325),
+    ("WIL", -103.6179, 48.1469),
+    ("HAV", -109.6841, 48.5500),
+    ("GPK", -113.9980, 48.4210),
+    ("WEN", -120.3103, 47.4235),
+    ("PAS", -119.1006, 46.2396),
+
+    # California / Coast
+    ("SAC", -121.4944, 38.5816),
+    ("RNO", -119.8138, 39.5296),
+    ("EMY", -122.2920, 37.8400),
+    ("SJC", -121.9010, 37.3290),
+    ("LAX", -118.2437, 34.0522),
+    ("SAN", -117.1611, 32.7157),
+
+    # California Zephyr extra interim (+2 more)
+    ("DEN", -104.9903, 39.7392),
+    ("GJT", -108.5506, 39.0639),
+    ("GLN", -107.3248, 39.5505),  # Glenwood Springs-ish
+    ("SLC", -111.8910, 40.7608),  # not Zephyr, but useful ref
+    ("OMA", -95.9345, 41.2565),   # reference
+    ("CHI", -87.6300, 41.8819),
+
+    # Southwest Chief interim (>=4 more)
+    ("GBB", -90.3712, 40.9478),   # Galesburg-ish
+    ("KCY", -94.5786, 39.0997),   # Kansas City-ish
+    ("NEW", -97.3450, 38.0354),   # Newton, KS-ish
+    ("DDG", -100.0171, 37.7528),  # Dodge City-ish
+    ("LAM", -103.5438, 37.9850),  # La Junta-ish
+    ("ABQ", -106.6504, 35.0844),
+    ("GUP", -108.7426, 35.5281),  # Gallup-ish
+    ("FLG", -111.6513, 35.1983),  # Flagstaff-ish
+
+    # Texas Eagle interim (>=4 more)
+    ("SPI", -89.6501, 39.8017),   # Springfield, IL-ish
+    ("STL", -90.1994, 38.6270),
+    ("LRK", -92.2896, 34.7465),   # Little Rock-ish
+    ("DAL", -96.7970, 32.7767),   # Dallas-ish
+    ("FTW", -97.3308, 32.7555),   # Fort Worth-ish
+    ("AUS", -97.7431, 30.2672),   # Austin-ish
+    ("SAS", -98.4936, 29.4241),   # San Antonio-ish
+
+    # South / East
+    ("NOL", -90.0715, 29.9511),
+    ("ATL", -84.3880, 33.7490),
+    ("PHL", -75.1652, 39.9526),
+    ("WAS", -77.0067, 38.8977),
+    ("NYP", -73.9940, 40.7527),
+    ("BOS", -71.0589, 42.3601),
+    ("MIA", -80.1918, 25.7617),
+
+    # Great Lakes references
+    ("CLE", -81.6944, 41.4993),
+    ("BUF", -78.8784, 42.8864),
+    ("ALB", -73.7562, 42.6526),
+]
+
+# --- Draw ONLY a sub-segment of a route (to avoid clashes) ---
+# Sunset Limited: keep only New Orleans <-> San Antonio
+SUBSEGMENT_LIMITS = {
+    "Sunset Limited": (("NOL", -90.0715, 29.9511), ("SAS", -98.4936, 29.4241)),
+}
 
 
 def _download_bytes_cached(url: str, cache: dict, key_bytes: str, key_time: str, max_age_minutes: int = 1440) -> bytes:
@@ -228,7 +267,6 @@ def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
 
 
 def _draw_station_labels(ax):
-    # De-duplicate by code (in case you add extras later)
     seen = set()
     for code, lon, lat in STATION_MARKERS:
         if code in seen:
@@ -339,6 +377,33 @@ def _load_trips_and_stops(run_date: date):
     return routes_branches, stop_times, stops
 
 
+def _nearest_index_by_coord(st_df: pd.DataFrame, lon: float, lat: float) -> int:
+    # st_df must contain stop_lon/stop_lat
+    lons = st_df["stop_lon"].astype(float).to_numpy()
+    lats = st_df["stop_lat"].astype(float).to_numpy()
+    d2 = (lons - lon) ** 2 + (lats - lat) ** 2
+    return int(d2.argmin())
+
+
+def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If a route has a subsegment limit, slice the stop sequence between the two nearest endpoints.
+    """
+    if route_name not in SUBSEGMENT_LIMITS:
+        return st_df
+
+    (c1, lon1, lat1), (c2, lon2, lat2) = SUBSEGMENT_LIMITS[route_name]
+    if len(st_df) < 2:
+        return st_df
+
+    i1 = _nearest_index_by_coord(st_df, lon1, lat1)
+    i2 = _nearest_index_by_coord(st_df, lon2, lat2)
+    lo, hi = (i1, i2) if i1 <= i2 else (i2, i1)
+
+    sliced = st_df.iloc[lo:hi + 1].copy()
+    return sliced if len(sliced) >= 2 else st_df
+
+
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
 
@@ -349,8 +414,6 @@ def _make_map(run_date: date):
     )
     ax.set_xlim(-125, -66)
     ax.set_ylim(24, 50)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.grid(True, linewidth=0.3, alpha=0.20)
@@ -392,8 +455,12 @@ def _make_map(run_date: date):
 
             center_trip = trip0 or trip1
 
+            # Geometry from center_trip
             st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
             st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
+
+            # If we only want a portion (Sunset Limited NOL<->SAS), slice here
+            st_geom = _apply_subsegment_if_needed(name, st_geom)
             if len(st_geom) < 2:
                 continue
 
@@ -414,6 +481,9 @@ def _make_map(run_date: date):
 
                 st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
                 st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"]).sort_values("stop_sequence")
+
+                # Slice timings the same way for subsegment routes
+                st_time = _apply_subsegment_if_needed(name, st_time)
                 if len(st_time) < 2:
                     continue
 
@@ -469,7 +539,7 @@ def _make_map(run_date: date):
                         zorder=5,
                     )
 
-                    # Chevrons NIGHT ONLY (more visible) + keep away from ends
+                    # Chevrons NIGHT ONLY + keep away from ends
                     if not daylight:
                         near_start = i < CHEVRON_SKIP_END_SEGMENTS
                         near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
