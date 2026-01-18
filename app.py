@@ -2,6 +2,7 @@ import os
 import io
 import zipfile
 import math
+import json
 from datetime import datetime, timedelta, date
 from collections import defaultdict
 
@@ -15,9 +16,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 import matplotlib.lines as mlines
-from matplotlib.backends.backend_pdf import PdfPages
-
-from PIL import Image
 
 import pandas as pd
 import requests
@@ -55,7 +53,7 @@ NIGHT_LINEWIDTH = 1.1
 NIGHT_ALPHA = 0.55
 
 # ---- Parallel separation ----
-PARALLEL_GAP_DEG = 0.17
+PARALLEL_GAP_DEG = 0.17  # visual offset between the two directions
 
 # ---- Label styling (trigraphs + POIs) ----
 LABEL_FONTSIZE = 7.0
@@ -78,11 +76,19 @@ LIGHT_MAJORITY_THRESHOLD = 0.5  # >0.5 => mostly light
 
 # ---- Auto-fit map extent to routes ----
 AUTO_FIT_MAP = True
-FIT_MARGIN_DEG_X = 2.0
-FIT_MARGIN_DEG_Y = 1.5
+FIT_MARGIN_DEG_X = 1.1
+FIT_MARGIN_DEG_Y = 0.9
 # Safety clamp (CONUS-ish window)
 FIT_MIN_LON, FIT_MAX_LON = -125, -66
 FIT_MIN_LAT, FIT_MAX_LAT = 24, 50
+
+# ---- State boundary background (GeoJSON in lon/lat; matches routes) ----
+STATES_GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "assets", "us_states.geojson")
+STATE_LINE_COLOUR = "#d0d0d0"
+STATE_LINEWIDTH = 0.65
+STATE_ALPHA = 0.9
+STATE_ZORDER = 1
+STATE_POINT_STRIDE = 2  # >1 reduces detail (faster/cleaner). Try 1 for max detail.
 
 # ---- Fixed colours ----
 HEX_PALETTE = [
@@ -93,33 +99,10 @@ HEX_PALETTE = [
 ]
 ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
 
-# ---- Background states PNG ----
-BACKGROUND_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "assets", "us_states.png")
-BACKGROUND_ALPHA = 0.20
-
-def _draw_background_states(ax):
-    # Never crash if missing/bad image
-    if not os.path.exists(BACKGROUND_IMAGE_PATH):
-        print("Background image not found:", BACKGROUND_IMAGE_PATH)
-        return
-    try:
-        img = Image.open(BACKGROUND_IMAGE_PATH)
-        w, h = img.size
-        # Safety: skip if someone swaps in a huge image again
-        if w * h > 180_000_000:
-            print("Background image too large, skipping:", img.size)
-            return
-        img = img.convert("RGBA")
-        ax.imshow(
-            img,
-            extent=(FIT_MIN_LON, FIT_MAX_LON, FIT_MIN_LAT, FIT_MAX_LAT),
-            origin="upper",
-            alpha=BACKGROUND_ALPHA,
-            zorder=0,
-            aspect="auto",
-        )
-    except Exception as e:
-        print("Failed to draw background:", e)
+# --- Sunset Limited only NOL <-> SAS (to avoid clashing with Texas Eagle elsewhere) ---
+SUBSEGMENT_LIMITS = {
+    "Sunset Limited": (("NOL", -90.0715, 29.9511), ("SAS", -98.4936, 29.4241)),
+}
 
 # ---- Trigraph markers (FTW removed) ----
 STATION_MARKERS = [
@@ -163,14 +146,13 @@ SCENIC_POIS = [
     ("MISSISSIPPI", -90.20, 35.10,  0.55, -0.10),
 ]
 
-# --- Sunset Limited only NOL <-> SAS (to avoid clashing with Texas Eagle elsewhere) ---
-SUBSEGMENT_LIMITS = {
-    "Sunset Limited": (("NOL", -90.0715, 29.9511), ("SAS", -98.4936, 29.4241)),
-}
-
 # ---- GTFS cache (avoid re-downloading every request) ----
 _GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
 GTFS_MAX_AGE_MINUTES = 60
+
+# ---- GeoJSON cache (states boundaries) ----
+_STATES_CACHE = {"loaded": False, "lines": []}
+
 
 def _download_gtfs_zip_bytes() -> bytes:
     now = datetime.utcnow()
@@ -185,15 +167,17 @@ def _download_gtfs_zip_bytes() -> bytes:
     _GTFS_CACHE["fetched_at"] = now
     return r.content
 
+
 def _draw_text_label(ax, text, lon, lat):
     ax.text(
         lon, lat, text,
         fontsize=LABEL_FONTSIZE,
         ha="center", va="center",
         color="black",
-        zorder=20,
+        zorder=25,
         path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
     )
+
 
 def _draw_station_labels(ax):
     seen = set()
@@ -203,9 +187,11 @@ def _draw_station_labels(ax):
         seen.add(code)
         _draw_text_label(ax, code, lon, lat)
 
+
 def _draw_scenic_pois(ax):
     for label, lon, lat, dx, dy in SCENIC_POIS:
         _draw_text_label(ax, label, lon + dx, lat + dy)
+
 
 def _sun_civil_times(lat: float, lon: float, tz_name: str, on_date: date):
     try:
@@ -216,11 +202,13 @@ def _sun_civil_times(lat: float, lon: float, tz_name: str, on_date: date):
     s = sun(loc.observer, date=on_date, tzinfo=tz)
     return s["dawn"], s["dusk"]
 
+
 def _parse_gtfs_time(t):
     if pd.isna(t) or not isinstance(t, str) or not t.strip():
         return None
     h, m, s = t.split(":")
     return int(h) * 3600 + int(m) * 60 + int(s)
+
 
 def _service_active_on(row, yyyymmdd: str) -> bool:
     d = datetime.strptime(yyyymmdd, "%Y%m%d").date()
@@ -232,6 +220,7 @@ def _service_active_on(row, yyyymmdd: str) -> bool:
     cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     return int(row[cols[weekday]]) == 1
 
+
 def _branch_key_for_trip(trip_id: str, stop_times: pd.DataFrame, stops: pd.DataFrame):
     st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
     st = st.dropna(subset=["stop_lat", "stop_lon"]).sort_values("stop_sequence")
@@ -242,6 +231,7 @@ def _branch_key_for_trip(trip_id: str, stop_times: pd.DataFrame, stops: pd.DataF
     p0 = (round(float(a["stop_lat"]), 1), round(float(a["stop_lon"]), 1))
     p1 = (round(float(b["stop_lat"]), 1), round(float(b["stop_lon"]), 1))
     return frozenset((p0, p1))
+
 
 def _load_trips_and_stops(run_date: date):
     zip_bytes = _download_gtfs_zip_bytes()
@@ -294,11 +284,13 @@ def _load_trips_and_stops(run_date: date):
 
     return routes_branches, stop_times, stops
 
+
 def _nearest_index_by_coord(st_df: pd.DataFrame, lon: float, lat: float) -> int:
     lons = st_df["stop_lon"].astype(float).to_numpy()
     lats = st_df["stop_lat"].astype(float).to_numpy()
     d2 = (lons - lon) ** 2 + (lats - lat) ** 2
     return int(d2.argmin())
+
 
 def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.DataFrame:
     if route_name not in SUBSEGMENT_LIMITS:
@@ -315,6 +307,7 @@ def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.Data
     sliced = st_df.iloc[lo:hi + 1].copy()
     return sliced if len(sliced) >= 2 else st_df
 
+
 def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
     first = st_time.iloc[0]
     origin_tz = first["stop_timezone"]
@@ -330,10 +323,12 @@ def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
     origin_dt_local = tz.localize(datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=int(origin_dep_sec)))
     return origin_dt_local, int(origin_dep_sec)
 
+
 def _map_seg_index(i, nseg_geom, nseg_time):
     if nseg_geom <= 1 or nseg_time <= 1:
         return min(i, max(0, nseg_time - 1))
     return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
+
 
 def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
     a = math.radians(CHEVRON_ANGLE_DEG)
@@ -352,6 +347,7 @@ def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
 
     ax.plot([left_x, tip_x], [left_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
     ax.plot([right_x, tip_x], [right_y, tip_y], color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT, zorder=CHEVRON_ZORDER)
+
 
 def _classify_light_civil_with_sampling(origin_dt_local, origin_dep_sec: int, a_row, b_row, tz_name_here: str) -> bool:
     try:
@@ -386,6 +382,7 @@ def _classify_light_civil_with_sampling(origin_dt_local, origin_dep_sec: int, a_
 
     return (votes / n) > LIGHT_MAJORITY_THRESHOLD
 
+
 def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
     n = len(lons)
     if n < 2:
@@ -415,6 +412,7 @@ def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
         outy[i] = lats[i] + uy * gap_deg * side_sign
 
     return outx, outy
+
 
 def _compute_route_bounds(routes_branches, stop_times, stops):
     min_lon = 999.0
@@ -449,6 +447,80 @@ def _compute_route_bounds(routes_branches, stop_times, stops):
 
     return min_lon, max_lon, min_lat, max_lat
 
+
+def _ensure_states_loaded():
+    if _STATES_CACHE["loaded"]:
+        return
+
+    lines = []
+
+    if not os.path.exists(STATES_GEOJSON_PATH):
+        print("States GeoJSON missing:", STATES_GEOJSON_PATH)
+        _STATES_CACHE["lines"] = []
+        _STATES_CACHE["loaded"] = True
+        return
+
+    try:
+        with open(STATES_GEOJSON_PATH, "r", encoding="utf-8") as f:
+            gj = json.load(f)
+
+        feats = gj.get("features", [])
+        for feat in feats:
+            geom = feat.get("geometry") or {}
+            gtype = geom.get("type")
+            coords = geom.get("coordinates")
+            if not coords:
+                continue
+
+            # We only draw polygon outlines (exterior rings).
+            if gtype == "Polygon":
+                # coords: [ring0, ring1...]
+                ring0 = coords[0]
+                lines.append(ring0)
+            elif gtype == "MultiPolygon":
+                # coords: [[ring0,...],[ring0,...],...]
+                for poly in coords:
+                    if poly and poly[0]:
+                        lines.append(poly[0])
+
+        _STATES_CACHE["lines"] = lines
+        _STATES_CACHE["loaded"] = True
+    except Exception as e:
+        print("Failed to load states GeoJSON:", e)
+        _STATES_CACHE["lines"] = []
+        _STATES_CACHE["loaded"] = True
+
+
+def _draw_state_boundaries(ax):
+    _ensure_states_loaded()
+    if not _STATES_CACHE["lines"]:
+        return
+
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+
+    for ring in _STATES_CACHE["lines"]:
+        # ring is list of [lon, lat] pairs
+        xs = []
+        ys = []
+        stride = max(1, int(STATE_POINT_STRIDE))
+
+        for i in range(0, len(ring), stride):
+            lon, lat = ring[i][0], ring[i][1]
+            # quick clip to view window with a small buffer
+            if (x0 - 2) <= lon <= (x1 + 2) and (y0 - 2) <= lat <= (y1 + 2):
+                xs.append(lon)
+                ys.append(lat)
+            else:
+                # keep breaks to avoid long diagonal lines from far-away clipped points
+                if len(xs) >= 2:
+                    ax.plot(xs, ys, color=STATE_LINE_COLOUR, lw=STATE_LINEWIDTH, alpha=STATE_ALPHA, zorder=STATE_ZORDER)
+                xs, ys = [], []
+
+        if len(xs) >= 2:
+            ax.plot(xs, ys, color=STATE_LINE_COLOUR, lw=STATE_LINEWIDTH, alpha=STATE_ALPHA, zorder=STATE_ZORDER)
+
+
 def _make_map(run_date: date):
     routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
 
@@ -457,13 +529,11 @@ def _make_map(run_date: date):
     if AUTO_FIT_MAP:
         min_lon, max_lon, min_lat, max_lat = _compute_route_bounds(routes_branches, stop_times, stops)
 
-        # Pad to make room for offsets/chevrons/labels
         min_lon -= FIT_MARGIN_DEG_X
         max_lon += FIT_MARGIN_DEG_X
         min_lat -= FIT_MARGIN_DEG_Y
         max_lat += FIT_MARGIN_DEG_Y
 
-        # Clamp to CONUS-ish window (keeps view sensible)
         min_lon = max(min_lon, FIT_MIN_LON)
         max_lon = min(max_lon, FIT_MAX_LON)
         min_lat = max(min_lat, FIT_MIN_LAT)
@@ -475,8 +545,8 @@ def _make_map(run_date: date):
         ax.set_xlim(FIT_MIN_LON, FIT_MAX_LON)
         ax.set_ylim(FIT_MIN_LAT, FIT_MAX_LAT)
 
-    # Background goes first (always drawn in the CONUS extent; your axes may be zoomed within it)
-    _draw_background_states(ax)
+    # Draw vector state boundaries (matches lon/lat; no projection mismatch)
+    _draw_state_boundaries(ax)
 
     ax.set_title(f"Amtrak Long-Distance Routes\nCivil Twilight (dawn to dusk) — {run_date}", fontsize=14)
     ax.set_xlabel("Longitude")
@@ -593,6 +663,7 @@ def _make_map(run_date: date):
     fig.tight_layout()
     return fig
 
+
 def build_png_bytes(run_date: date) -> bytes:
     fig = _make_map(run_date)
     buf = io.BytesIO()
@@ -600,6 +671,7 @@ def build_png_bytes(run_date: date) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
+
 
 @app.get("/")
 def index():
@@ -617,6 +689,7 @@ def index():
         .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 12px; }}
         img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
         input {{ padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; }}
+        button {{ padding: 8px 12px; border-radius: 8px; border: 1px solid #aaa; background: #f7f7f7; }}
       </style>
     </head>
     <body>
@@ -636,6 +709,7 @@ def index():
     </html>
     """
     return Response(html, mimetype="text/html")
+
 
 @app.get("/map.png")
 def map_png():
