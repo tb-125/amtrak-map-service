@@ -1,21 +1,10 @@
 import os
 import io
-import zipfile
-import math
 import json
-from datetime import datetime, timedelta, date
-from collections import defaultdict
-
-# --- Render-safe matplotlib setup (BEFORE importing pyplot) ---
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
-os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
-
-import matplotlib
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
-import matplotlib.lines as mlines
+import math
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -23,13 +12,44 @@ import pytz
 from astral import LocationInfo
 from astral.sun import sun
 
-from flask import Flask, Response, request, abort
+from flask import Flask, request, send_file, abort, make_response, Response
 
-app = Flask(__name__)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+
+from PIL import Image
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
 
-# ---------------- ROUTES ----------------
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+GTFS_CACHE_PATH = CACHE_DIR / "GTFS.zip"
+GTFS_CACHE_MAX_AGE_HOURS = int(os.environ.get("GTFS_CACHE_MAX_AGE_HOURS", "24"))
+
+BASEMAP_PATH = os.environ.get("BASEMAP_PATH", "assets/us_basemap.png")
+
+# Map bounds (Lower 48)
+X_MIN, X_MAX = -125, -66
+Y_MIN, Y_MAX = 24, 50
+
+FIGSIZE = (16, 9)
+DPI = 170
+
+DAY_COLOR = "#d21f1f"     # red
+NIGHT_COLOR = "#1f3aa6"   # blue
+LINE_WIDTH = 3.2
+
+STATION_DOT_SIZE = 18
+STATION_DOT_EDGE = 0.9
+
 LONG_DISTANCE_NAMES = [
     "Auto Train",
     "California Zephyr",
@@ -47,715 +67,342 @@ LONG_DISTANCE_NAMES = [
     "Floridian",
 ]
 
-# ---- Day/Night styling ----
-DAY_LINEWIDTH = 2.6
-NIGHT_LINEWIDTH = 1.1
-NIGHT_ALPHA = 0.55
-
-# ---- Parallel separation ----
-PARALLEL_GAP_DEG = 0.17  # visual offset between the two directions
-
-# ---- Label styling (trigraphs + POIs) ----
-LABEL_FONTSIZE = 7.0
-LABEL_HALO_WIDTH = 2.6
-
-# ---- Chevrons (night-only) ----
-CHEVRON_EVERY_N_SEGMENTS = 7
-CHEVRON_SKIP_END_SEGMENTS = 3
-CHEVRON_SIZE_DEG = 0.36
-CHEVRON_ANGLE_DEG = 24
-CHEVRON_LW_NIGHT = 1.05
-CHEVRON_ALPHA_NIGHT = 0.90
-CHEVRON_ZORDER = 10
-
-# ---- Light accuracy ----
-# Civil twilight: treat "light" as dawn..dusk
-# Sampling: vote across multiple points along the segment
-LIGHT_SAMPLE_POINTS_PER_SEGMENT = 5
-LIGHT_MAJORITY_THRESHOLD = 0.5  # >0.5 => mostly light
-
-# ---- Auto-fit map extent to routes ----
-AUTO_FIT_MAP = True
-FIT_MARGIN_DEG_X = 1.1
-FIT_MARGIN_DEG_Y = 0.9
-# Safety clamp (CONUS-ish window)
-FIT_MIN_LON, FIT_MAX_LON = -125, -66
-FIT_MIN_LAT, FIT_MAX_LAT = 24, 50
-
-# ---- State boundary background (GeoJSON in lon/lat; matches routes) ----
-STATES_GEOJSON_PATH = os.path.join(os.path.dirname(__file__), "assets", "us_states.geojson")
-STATE_LINE_COLOUR = "#d0d0d0"
-STATE_LINEWIDTH = 0.65
-STATE_ALPHA = 0.9
-STATE_ZORDER = 1
-STATE_POINT_STRIDE = 2  # >1 reduces detail (faster/cleaner). Try 1 for max detail.
-
-# ---- Fixed colours ----
-HEX_PALETTE = [
-    "#1b9e77", "#d95f02", "#7570b3", "#e7298a",
-    "#66a61e", "#e6ab02", "#a6761d", "#666666",
-    "#1f78b4", "#b2df8a", "#fb9a99", "#fdbf6f",
-    "#cab2d6", "#6a3d9a",
-]
-ROUTE_COLOURS = {name: HEX_PALETTE[i % len(HEX_PALETTE)] for i, name in enumerate(LONG_DISTANCE_NAMES)}
-
-# --- Sunset Limited only NOL <-> SAS (to avoid clashing with Texas Eagle elsewhere) ---
-SUBSEGMENT_LIMITS = {
-    "Sunset Limited": (("NOL", -90.0715, 29.9511), ("SAS", -98.4936, 29.4241)),
+MAJOR_CITIES = {
+    "Seattle": (-122.33, 47.61),
+    "Portland": (-122.68, 45.52),
+    "San Francisco": (-122.42, 37.77),
+    "Los Angeles": (-118.24, 34.05),
+    "Denver": (-104.99, 39.74),
+    "Chicago": (-87.63, 41.88),
+    "New York": (-74.00, 40.71),
+    "Washington, DC": (-77.04, 38.91),
+    "Miami": (-80.19, 25.76),
 }
 
-# ---- Trigraph markers (FTW removed) ----
-STATION_MARKERS = [
-    ("SEA", -122.3301, 47.6038),
-    ("PDX", -122.6765, 45.5231),
-    ("SPK", -117.4260, 47.6588),
-    ("MSP", -93.2650, 44.9778),
-    ("FAR", -96.7898, 46.8772),
-    ("GPK", -113.9980, 48.4210),
-    ("SAC", -121.4944, 38.5816),
-    ("RNO", -119.8138, 39.5296),
-    ("DEN", -104.9903, 39.7392),
-    ("GJT", -108.5506, 39.0639),
-    ("GLN", -107.3248, 39.5505),
-    ("CHI", -87.6300, 41.8819),
-    ("KCY", -94.5786, 39.0997),
-    ("ABQ", -106.6504, 35.0844),
-    ("FLG", -111.6513, 35.1983),
-    ("STL", -90.1994, 38.6270),
-    ("LRK", -92.2896, 34.7465),
-    ("DAL", -96.7970, 32.7767),
-    ("AUS", -97.7431, 30.2672),
-    ("SAS", -98.4936, 29.4241),
-    ("NOL", -90.0715, 29.9511),
-    ("ATL", -84.3880, 33.7490),
-    ("WAS", -77.0067, 38.8977),
-    ("NYP", -73.9940, 40.7527),
-    ("BOS", -71.0589, 42.3601),
-    ("MIA", -80.1918, 25.7617),
-]
-
-# ---- Scenic POIs (nudged off tracks) ----
-# (label, lon, lat, dx, dy)
-SCENIC_POIS = [
-    ("GLACIER NP", -113.80, 48.70,  0.40,  0.20),
-    ("MARIAS PASS", -113.30, 48.30,  0.35, -0.20),
-    ("COLUMBIA R.", -120.00, 46.10, -0.35,  0.20),
-    ("ROCKY MTNS", -106.50, 39.40,  0.45,  0.25),
-    ("GLENWOOD\nCANYON", -107.20, 39.60, -0.45,  0.10),
-    ("RATON PASS", -105.20, 36.90,  0.45, -0.25),
-    ("MISSISSIPPI", -90.20, 35.10,  0.55, -0.10),
-]
-
-# ---- GTFS cache (avoid re-downloading every request) ----
-_GTFS_CACHE = {"fetched_at": None, "zip_bytes": None}
-GTFS_MAX_AGE_MINUTES = 60
-
-# ---- GeoJSON cache (states boundaries) ----
-_STATES_CACHE = {"loaded": False, "lines": []}
+CITY_OFFSETS = {
+    "Chicago": (-0.8, 0.3),
+    "New York": (0.6, 0.3),
+    "Washington, DC": (0.6, -0.2),
+}
 
 
-def _download_gtfs_zip_bytes() -> bytes:
-    now = datetime.utcnow()
-    if _GTFS_CACHE["zip_bytes"] is not None and _GTFS_CACHE["fetched_at"] is not None:
-        age = (now - _GTFS_CACHE["fetched_at"]).total_seconds() / 60.0
-        if age <= GTFS_MAX_AGE_MINUTES:
-            return _GTFS_CACHE["zip_bytes"]
+# ============================================================
+# Helper functions
+# ============================================================
 
-    r = requests.get(GTFS_URL, timeout=60, headers={"User-Agent": "amtrak-map-service/1.0"})
-    r.raise_for_status()
-    _GTFS_CACHE["zip_bytes"] = r.content
-    _GTFS_CACHE["fetched_at"] = now
-    return r.content
-
-
-def _draw_text_label(ax, text, lon, lat):
-    ax.text(
-        lon, lat, text,
-        fontsize=LABEL_FONTSIZE,
-        ha="center", va="center",
-        color="black",
-        zorder=25,
-        path_effects=[pe.withStroke(linewidth=LABEL_HALO_WIDTH, foreground="white")],
-    )
-
-
-def _draw_station_labels(ax):
-    seen = set()
-    for code, lon, lat in STATION_MARKERS:
-        if code in seen:
-            continue
-        seen.add(code)
-        _draw_text_label(ax, code, lon, lat)
-
-
-def _draw_scenic_pois(ax):
-    for label, lon, lat, dx, dy in SCENIC_POIS:
-        _draw_text_label(ax, label, lon + dx, lat + dy)
-
-
-def _sun_civil_times(lat: float, lon: float, tz_name: str, on_date: date):
-    try:
-        tz = pytz.timezone(tz_name)
-    except Exception:
-        tz = pytz.UTC
-    loc = LocationInfo(latitude=lat, longitude=lon, timezone=getattr(tz, "zone", "UTC"))
-    s = sun(loc.observer, date=on_date, tzinfo=tz)
-    return s["dawn"], s["dusk"]
-
-
-def _parse_gtfs_time(t):
-    if pd.isna(t) or not isinstance(t, str) or not t.strip():
+def parse_gtfs_time(t):
+    if pd.isna(t) or not isinstance(t, str):
         return None
     h, m, s = t.split(":")
     return int(h) * 3600 + int(m) * 60 + int(s)
 
 
-def _service_active_on(row, yyyymmdd: str) -> bool:
+def service_active_on(row, yyyymmdd):
     d = datetime.strptime(yyyymmdd, "%Y%m%d").date()
     start = datetime.strptime(str(row["start_date"]), "%Y%m%d").date()
     end = datetime.strptime(str(row["end_date"]), "%Y%m%d").date()
     if not (start <= d <= end):
         return False
     weekday = d.weekday()
-    cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    cols = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
     return int(row[cols[weekday]]) == 1
 
 
-def _branch_key_for_trip(trip_id: str, stop_times: pd.DataFrame, stops: pd.DataFrame):
-    st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id", how="left")
-    st = st.dropna(subset=["stop_lat", "stop_lon"]).sort_values("stop_sequence")
-    if len(st) < 2:
-        return None
-    a = st.iloc[0]
-    b = st.iloc[-1]
-    p0 = (round(float(a["stop_lat"]), 1), round(float(a["stop_lon"]), 1))
-    p1 = (round(float(b["stop_lat"]), 1), round(float(b["stop_lon"]), 1))
-    return frozenset((p0, p1))
-
-
-def _load_trips_and_stops(run_date: date):
-    zip_bytes = _download_gtfs_zip_bytes()
-    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
-
-    routes = pd.read_csv(z.open("routes.txt"))
-    trips = pd.read_csv(z.open("trips.txt"))
-    stop_times = pd.read_csv(z.open("stop_times.txt"))
-    stops = pd.read_csv(z.open("stops.txt"))
-    calendar = pd.read_csv(z.open("calendar.txt"))
-
-    yyyymmdd = run_date.strftime("%Y%m%d")
-    active_services = {
-        row["service_id"]
-        for _, row in calendar.iterrows()
-        if _service_active_on(row, yyyymmdd)
-    }
-
-    trips = trips[trips["service_id"].isin(active_services)]
-    routes = routes[routes["route_long_name"].isin(LONG_DISTANCE_NAMES)]
-    trips = trips.merge(routes[["route_id", "route_long_name"]], on="route_id")
-
-    stop_times = stop_times[stop_times["trip_id"].isin(trips["trip_id"])].copy()
-    stop_times["arr_sec"] = stop_times["arrival_time"].apply(_parse_gtfs_time)
-    stop_times["dep_sec"] = stop_times["departure_time"].apply(_parse_gtfs_time)
-    stop_times = stop_times.sort_values(["trip_id", "stop_sequence"])
-
-    stops = stops[["stop_id", "stop_lat", "stop_lon", "stop_timezone"]].copy()
-    stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
-
-    trip_stop_counts = stop_times.groupby("trip_id").size().to_dict()
-
-    candidates = defaultdict(list)
-    for _, r in trips.iterrows():
-        name = r["route_long_name"]
-        direction = int(r.get("direction_id", 0))
-        tid = r["trip_id"]
-        bk = _branch_key_for_trip(tid, stop_times, stops)
-        if bk is None:
-            continue
-        candidates[(name, direction, bk)].append(tid)
-
-    routes_branches = defaultdict(lambda: defaultdict(dict))
-    for (name, direction, bk), tids in candidates.items():
-        best = max(tids, key=lambda t: trip_stop_counts.get(t, 0))
-        routes_branches[name][bk][direction] = best
-
-    if not routes_branches:
-        raise RuntimeError("No matching long-distance trips found for that date in the GTFS feed.")
-
-    return routes_branches, stop_times, stops
-
-
-def _nearest_index_by_coord(st_df: pd.DataFrame, lon: float, lat: float) -> int:
-    lons = st_df["stop_lon"].astype(float).to_numpy()
-    lats = st_df["stop_lat"].astype(float).to_numpy()
-    d2 = (lons - lon) ** 2 + (lats - lat) ** 2
-    return int(d2.argmin())
-
-
-def _apply_subsegment_if_needed(route_name: str, st_df: pd.DataFrame) -> pd.DataFrame:
-    if route_name not in SUBSEGMENT_LIMITS:
-        return st_df
-
-    (_, lon1, lat1), (_, lon2, lat2) = SUBSEGMENT_LIMITS[route_name]
-    if len(st_df) < 2:
-        return st_df
-
-    i1 = _nearest_index_by_coord(st_df, lon1, lat1)
-    i2 = _nearest_index_by_coord(st_df, lon2, lat2)
-    lo, hi = (i1, i2) if i1 <= i2 else (i2, i1)
-
-    sliced = st_df.iloc[lo:hi + 1].copy()
-    return sliced if len(sliced) >= 2 else st_df
-
-
-def _trip_anchor_datetime(run_date: date, st_time: pd.DataFrame):
-    first = st_time.iloc[0]
-    origin_tz = first["stop_timezone"]
-    origin_dep_sec = first["dep_sec"]
-    if origin_dep_sec is None or pd.isna(origin_dep_sec):
-        origin_dep_sec = first["arr_sec"]
-
+def is_daylight(lat, lon, tz_name, dt_local):
     try:
-        tz = pytz.timezone(origin_tz)
+        tz = pytz.timezone(tz_name)
     except Exception:
         tz = pytz.UTC
 
-    origin_dt_local = tz.localize(
-        datetime(run_date.year, run_date.month, run_date.day)
-        + timedelta(seconds=int(origin_dep_sec))
+    loc = LocationInfo(latitude=lat, longitude=lon, timezone=tz.zone)
+    if dt_local.tzinfo is None:
+        dt_local = tz.localize(dt_local)
+
+    s = sun(loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
+    return s["sunrise"] <= dt_local <= s["sunset"]
+
+
+def gtfs_is_fresh(path):
+    if not path.exists():
+        return False
+    age = datetime.utcnow() - datetime.utcfromtimestamp(path.stat().st_mtime)
+    return age.total_seconds() < GTFS_CACHE_MAX_AGE_HOURS * 3600
+
+
+def get_gtfs_zip():
+    if not gtfs_is_fresh(GTFS_CACHE_PATH):
+        r = requests.get(GTFS_URL, timeout=60)
+        r.raise_for_status()
+        GTFS_CACHE_PATH.write_bytes(r.content)
+    return zipfile.ZipFile(GTFS_CACHE_PATH)
+
+
+def read_txt(z, name):
+    with z.open(name) as f:
+        return pd.read_csv(f)
+
+
+def direction_id_from_param(dir_param):
+    return 0 if dir_param == "west" else 1
+
+
+def direction_label(dir_param):
+    return "Westbound / Northbound" if dir_param == "west" else "Eastbound / Southbound"
+
+
+def pick_representative_trips(trips_df, stop_times_df):
+    counts = stop_times_df.groupby("trip_id").size()
+    reps = {}
+    for (name, direction), grp in trips_df.groupby(["route_long_name", "direction_id"]):
+        sub = counts[counts.index.isin(grp["trip_id"])]
+        if len(sub):
+            reps[(name, int(direction))] = sub.sort_values(ascending=False).index[0]
+    return reps
+
+
+# ============================================================
+# PNG Renderer
+# ============================================================
+
+def render_map_png(date_str, dir_param):
+    run_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    z = get_gtfs_zip()
+    routes = read_txt(z, "routes.txt")
+    trips = read_txt(z, "trips.txt")
+    stop_times = read_txt(z, "stop_times.txt")
+    stops = read_txt(z, "stops.txt")
+    calendar = read_txt(z, "calendar.txt")
+
+    yyyymmdd = run_date.strftime("%Y%m%d")
+    active = {r["service_id"] for _, r in calendar.iterrows() if service_active_on(r, yyyymmdd)}
+
+    routes = routes[routes["route_long_name"].isin(LONG_DISTANCE_NAMES)]
+    trips = trips[trips["service_id"].isin(active)]
+    trips = trips.merge(routes[["route_id","route_long_name"]], on="route_id")
+
+    stop_times = stop_times[stop_times["trip_id"].isin(trips["trip_id"])]
+    stop_times["arr_sec"] = stop_times["arrival_time"].apply(parse_gtfs_time)
+    stop_times["dep_sec"] = stop_times["departure_time"].apply(parse_gtfs_time)
+    stop_times = stop_times.sort_values(["trip_id","stop_sequence"])
+
+    stops = stops[["stop_id","stop_lat","stop_lon","stop_timezone"]]
+    stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
+
+    reps = pick_representative_trips(trips, stop_times)
+    direction_id = direction_id_from_param(dir_param)
+
+    fig, ax = plt.subplots(figsize=FIGSIZE)
+    ax.set_xlim(X_MIN, X_MAX)
+    ax.set_ylim(Y_MIN, Y_MAX)
+    ax.set_axis_off()
+
+    if os.path.exists(BASEMAP_PATH):
+        img = Image.open(BASEMAP_PATH)
+        ax.imshow(img, extent=[X_MIN, X_MAX, Y_MIN, Y_MAX], aspect="auto", zorder=0)
+    else:
+        ax.set_facecolor("#eef6fb")
+
+    fig.suptitle(
+        "Amtrak long-distance trains by night and day",
+        fontsize=20, fontweight="bold", color=DAY_COLOR, y=0.96
     )
-    return origin_dt_local, int(origin_dep_sec)
+    ax.set_title(f"{run_date} — {direction_label(dir_param)}", fontsize=12, color="0.3")
 
+    for city, (lon, lat) in MAJOR_CITIES.items():
+        dx, dy = CITY_OFFSETS.get(city, (0.25, 0.15))
+        ax.text(lon + dx, lat + dy, city, fontsize=8, color="0.25", zorder=2)
 
-def _map_seg_index(i, nseg_geom, nseg_time):
-    if nseg_geom <= 1 or nseg_time <= 1:
-        return min(i, max(0, nseg_time - 1))
-    return int(round(i * (nseg_time - 1) / (nseg_geom - 1)))
-
-
-def _draw_chevron_night_only(ax, x, y, heading_rad, colour):
-    a = math.radians(CHEVRON_ANGLE_DEG)
-    s = CHEVRON_SIZE_DEG
-
-    tip_x = x + math.cos(heading_rad) * (s * 0.35)
-    tip_y = y + math.sin(heading_rad) * (s * 0.35)
-
-    left_dir = heading_rad + math.pi - a
-    right_dir = heading_rad + math.pi + a
-
-    left_x = tip_x + math.cos(left_dir) * (s * 0.85)
-    left_y = tip_y + math.sin(left_dir) * (s * 0.85)
-    right_x = tip_x + math.cos(right_dir) * (s * 0.85)
-    right_y = tip_y + math.sin(right_dir) * (s * 0.85)
-
-    ax.plot(
-        [left_x, tip_x], [left_y, tip_y],
-        color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT,
-        zorder=CHEVRON_ZORDER
-    )
-    ax.plot(
-        [right_x, tip_x], [right_y, tip_y],
-        color=colour, lw=CHEVRON_LW_NIGHT, alpha=CHEVRON_ALPHA_NIGHT,
-        zorder=CHEVRON_ZORDER
-    )
-
-
-def _classify_light_civil_with_sampling(origin_dt_local, origin_dep_sec: int, a_row, b_row, tz_name_here: str) -> bool:
-    try:
-        tz_here = pytz.timezone(tz_name_here)
-    except Exception:
-        tz_here = pytz.UTC
-
-    t0 = int(a_row["dep_sec"])
-    t1 = int(b_row["arr_sec"])
-    if t1 < t0:
-        t1 = t1 + 24 * 3600
-
-    lat0 = float(a_row["stop_lat"])
-    lon0 = float(a_row["stop_lon"])
-    lat1 = float(b_row["stop_lat"])
-    lon1 = float(b_row["stop_lon"])
-
-    n = max(3, int(LIGHT_SAMPLE_POINTS_PER_SEGMENT))
-    votes = 0
-    for k in range(n):
-        f = k / (n - 1) if n > 1 else 0.5
-        t = int(round(t0 + (t1 - t0) * f))
-
-        dt_at_origin = origin_dt_local + timedelta(seconds=(t - origin_dep_sec))
-        dt_here = dt_at_origin.astimezone(tz_here)
-
-        lat = lat0 + (lat1 - lat0) * f
-        lon = lon0 + (lon1 - lon0) * f
-
-        dawn, dusk = _sun_civil_times(lat, lon, tz_name_here, dt_here.date())
-        votes += 1 if (dawn <= dt_here <= dusk) else 0
-
-    return (votes / n) > LIGHT_MAJORITY_THRESHOLD
-
-
-def _offset_polyline_constant_parallel(lons, lats, gap_deg, side_sign):
-    n = len(lons)
-    if n < 2:
-        return lons, lats
-
-    outx = [0.0] * n
-    outy = [0.0] * n
-
-    for i in range(n):
-        if i == 0:
-            dx = lons[1] - lons[0]
-            dy = lats[1] - lats[0]
-        elif i == n - 1:
-            dx = lons[n - 1] - lons[n - 2]
-            dy = lats[n - 1] - lats[n - 2]
-        else:
-            dx = lons[i + 1] - lons[i - 1]
-            dy = lats[i + 1] - lats[i - 1]
-
-        L = math.hypot(dx, dy)
-        if L == 0:
-            ux, uy = 0.0, 0.0
-        else:
-            ux, uy = (-dy / L, dx / L)
-
-        outx[i] = lons[i] + ux * gap_deg * side_sign
-        outy[i] = lats[i] + uy * gap_deg * side_sign
-
-    return outx, outy
-
-
-def _compute_route_bounds(routes_branches, stop_times, stops):
-    min_lon = 999.0
-    max_lon = -999.0
-    min_lat = 999.0
-    max_lat = -999.0
-
-    for name in LONG_DISTANCE_NAMES:
-        if name not in routes_branches:
-            continue
-        for _, dir_map in routes_branches[name].items():
-            center_trip = dir_map.get(0) or dir_map.get(1)
-            if not center_trip:
-                continue
-
-            st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
-            st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
-            st_geom = _apply_subsegment_if_needed(name, st_geom)
-            if len(st_geom) < 2:
-                continue
-
-            lons = st_geom["stop_lon"].astype(float).to_numpy()
-            lats = st_geom["stop_lat"].astype(float).to_numpy()
-
-            min_lon = min(min_lon, float(lons.min()))
-            max_lon = max(max_lon, float(lons.max()))
-            min_lat = min(min_lat, float(lats.min()))
-            max_lat = max(max_lat, float(lats.max()))
-
-    if min_lon > 900:
-        return FIT_MIN_LON, FIT_MAX_LON, FIT_MIN_LAT, FIT_MAX_LAT
-
-    return min_lon, max_lon, min_lat, max_lat
-
-
-# -------------------- STATES (GeoJSON) --------------------
-
-def _ensure_states_loaded():
-    if _STATES_CACHE["loaded"]:
-        return
-
-    polylines = []
-
-    if not os.path.exists(STATES_GEOJSON_PATH):
-        print("States GeoJSON missing:", STATES_GEOJSON_PATH)
-        _STATES_CACHE["lines"] = []
-        _STATES_CACHE["loaded"] = True
-        return
-
-    try:
-        with open(STATES_GEOJSON_PATH, "r", encoding="utf-8") as f:
-            gj = json.load(f)
-
-        feats = gj.get("features", [])
-
-        DROP = {"US-PR", "US-VI", "US-GU", "US-AS", "US-MP"}
-
-        def add_ring(ring):
-            if not ring or len(ring) < 2:
-                return
-            stride = max(1, int(STATE_POINT_STRIDE))
-            xs = [pt[0] for pt in ring[::stride]]
-            ys = [pt[1] for pt in ring[::stride]]
-            polylines.append((xs, ys))
-
-        for feat in feats:
-            props = feat.get("properties") or {}
-            iso = props.get("iso_3166_2") or props.get("ISO_3166_2") or props.get("iso") or ""
-            if isinstance(iso, str) and iso in DROP:
-                continue
-
-            geom = feat.get("geometry") or {}
-            gtype = geom.get("type")
-            coords = geom.get("coordinates")
-            if not coords:
-                continue
-
-            if gtype == "Polygon":
-                for ring in coords:
-                    add_ring(ring)
-
-            elif gtype == "MultiPolygon":
-                for poly in coords:
-                    for ring in poly:
-                        add_ring(ring)
-
-        _STATES_CACHE["lines"] = polylines
-        _STATES_CACHE["loaded"] = True
-
-    except Exception as e:
-        print("Failed to load states GeoJSON:", e)
-        _STATES_CACHE["lines"] = []
-        _STATES_CACHE["loaded"] = True
-
-
-def _draw_state_boundaries(ax):
-    _ensure_states_loaded()
-    lines = _STATES_CACHE["lines"]
-    if not lines:
-        return
-
-    x0, x1 = ax.get_xlim()
-    y0, y1 = ax.get_ylim()
-
-    for xs, ys in lines:
-        if not xs or not ys:
-            continue
-        if (max(xs) < x0) or (min(xs) > x1) or (max(ys) < y0) or (min(ys) > y1):
+    for rname in LONG_DISTANCE_NAMES:
+        key = (rname, direction_id)
+        if key not in reps:
             continue
 
-        ax.plot(
-            xs, ys,
-            color=STATE_LINE_COLOUR,
-            lw=STATE_LINEWIDTH,
-            alpha=STATE_ALPHA,
-            zorder=STATE_ZORDER
+        trip_id = reps[key]
+        st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id")
+        if len(st) < 2:
+            continue
+
+        for i in range(len(st) - 1):
+            a, b = st.iloc[i], st.iloc[i+1]
+            if a["dep_sec"] is None or b["arr_sec"] is None:
+                continue
+
+            mid = int((a["dep_sec"] + b["arr_sec"]) / 2)
+            dt = datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=mid)
+            try:
+                dt = pytz.timezone(a["stop_timezone"]).localize(dt)
+            except Exception:
+                dt = pytz.UTC.localize(dt)
+
+            daylight = is_daylight(
+                (a["stop_lat"] + b["stop_lat"]) / 2,
+                (a["stop_lon"] + b["stop_lon"]) / 2,
+                a["stop_timezone"],
+                dt
+            )
+
+            ax.plot(
+                [a["stop_lon"], b["stop_lon"]],
+                [a["stop_lat"], b["stop_lat"]],
+                color=DAY_COLOR if daylight else NIGHT_COLOR,
+                linewidth=LINE_WIDTH,
+                zorder=3
+            )
+
+        ax.scatter(
+            st["stop_lon"], st["stop_lat"],
+            s=STATION_DOT_SIZE,
+            facecolors="white",
+            edgecolors="0.15",
+            linewidths=STATION_DOT_EDGE,
+            zorder=4
         )
 
-
-# -------------------- MAP --------------------
-
-def _make_map(run_date: date):
-    routes_branches, stop_times, stops = _load_trips_and_stops(run_date)
-
-    fig, ax = plt.subplots(figsize=(18, 10))
-
-    if AUTO_FIT_MAP:
-        min_lon, max_lon, min_lat, max_lat = _compute_route_bounds(routes_branches, stop_times, stops)
-
-        min_lon -= FIT_MARGIN_DEG_X
-        max_lon += FIT_MARGIN_DEG_X
-        min_lat -= FIT_MARGIN_DEG_Y
-        max_lat += FIT_MARGIN_DEG_Y
-
-        min_lon = max(min_lon, FIT_MIN_LON)
-        max_lon = min(max_lon, FIT_MAX_LON)
-        min_lat = max(min_lat, FIT_MIN_LAT)
-        max_lat = min(max_lat, FIT_MAX_LAT)
-
-        ax.set_xlim(min_lon, max_lon)
-        ax.set_ylim(min_lat, max_lat)
-    else:
-        ax.set_xlim(FIT_MIN_LON, FIT_MAX_LON)
-        ax.set_ylim(FIT_MIN_LAT, FIT_MAX_LAT)
-
-    # Draw vector state boundaries (matches lon/lat; no projection mismatch)
-    _draw_state_boundaries(ax)
-
-    ax.set_title(f"Amtrak Long-Distance Routes\nCivil Twilight (dawn to dusk) — {run_date}", fontsize=14)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.grid(True, linewidth=0.3, alpha=0.20)
-
-    # Legends
-    style_handles = [
-        mlines.Line2D([], [], color="black", lw=DAY_LINEWIDTH, linestyle="-", label="Light (civil twilight)"),
-        mlines.Line2D([], [], color="black", lw=NIGHT_LINEWIDTH, linestyle="--", alpha=NIGHT_ALPHA, label="Dark"),
+    legend = [
+        mlines.Line2D([], [], color=DAY_COLOR, linewidth=4, label="Daylight"),
+        mlines.Line2D([], [], color=NIGHT_COLOR, linewidth=4, label="Darkness"),
     ]
-    style_leg = ax.legend(handles=style_handles, loc="lower left", fontsize=9, frameon=True)
-    ax.add_artist(style_leg)
+    ax.legend(handles=legend, loc="lower left", frameon=True)
 
-    legend_routes = [mlines.Line2D([], [], color=ROUTE_COLOURS[nm], lw=3, label=nm) for nm in LONG_DISTANCE_NAMES]
-    route_leg = ax.legend(
-        handles=legend_routes,
-        loc="lower right",
-        fontsize=8,
-        frameon=True,
-        title="Train services",
-        title_fontsize=9,
-    )
-    ax.add_artist(route_leg)
-
-    _draw_station_labels(ax)
-    _draw_scenic_pois(ax)
-
-    for name in LONG_DISTANCE_NAMES:
-        if name not in routes_branches:
-            continue
-
-        colour = ROUTE_COLOURS.get(name, "#000000")
-
-        for _, dir_map in routes_branches[name].items():
-            trip0 = dir_map.get(0)
-            trip1 = dir_map.get(1)
-            if not trip0 and not trip1:
-                continue
-
-            center_trip = trip0 or trip1
-
-            st_geom = stop_times[stop_times["trip_id"] == center_trip].merge(stops, on="stop_id", how="left")
-            st_geom = st_geom.dropna(subset=["stop_lat", "stop_lon", "stop_timezone"]).sort_values("stop_sequence")
-            st_geom = _apply_subsegment_if_needed(name, st_geom)
-            if len(st_geom) < 2:
-                continue
-
-            lons = [float(v) for v in st_geom["stop_lon"].tolist()]
-            lats = [float(v) for v in st_geom["stop_lat"].tolist()]
-
-            left_lons, left_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=-1.0)
-            right_lons, right_lats = _offset_polyline_constant_parallel(lons, lats, PARALLEL_GAP_DEG, side_sign=+1.0)
-
-            dir_tracks = [
-                (0, left_lons, left_lats, trip0),
-                (1, right_lons, right_lats, trip1),
-            ]
-
-            for direction_id, xs, ys, dir_trip in dir_tracks:
-                if not dir_trip:
-                    continue
-
-                st_time = stop_times[stop_times["trip_id"] == dir_trip].merge(stops, on="stop_id", how="left")
-                st_time = st_time.dropna(subset=["dep_sec", "arr_sec", "stop_timezone", "stop_lat", "stop_lon"]).sort_values("stop_sequence")
-                st_time = _apply_subsegment_if_needed(name, st_time)
-                if len(st_time) < 2:
-                    continue
-
-                origin_dt_local, origin_dep_sec = _trip_anchor_datetime(run_date, st_time)
-
-                # Reverse drawn geometry for direction 1 so chevrons point opposite
-                if direction_id == 1:
-                    xs = list(reversed(xs))
-                    ys = list(reversed(ys))
-
-                nseg = len(xs) - 1
-                nseg_time = len(st_time) - 1
-                if nseg <= 0 or nseg_time <= 0:
-                    continue
-
-                for i in range(nseg):
-                    j = _map_seg_index(i, nseg, nseg_time)
-                    a = st_time.iloc[j]
-                    b = st_time.iloc[min(j + 1, len(st_time) - 1)]
-
-                    if a["dep_sec"] is None or b["arr_sec"] is None:
-                        continue
-
-                    tz_name_here = a["stop_timezone"]
-                    is_light = _classify_light_civil_with_sampling(origin_dt_local, origin_dep_sec, a, b, tz_name_here)
-
-                    x0, y0 = xs[i], ys[i]
-                    x1, y1 = xs[i + 1], ys[i + 1]
-
-                    ax.plot(
-                        [x0, x1],
-                        [y0, y1],
-                        color=colour,
-                        linewidth=DAY_LINEWIDTH if is_light else NIGHT_LINEWIDTH,
-                        linestyle="-" if is_light else "--",
-                        alpha=1.0 if is_light else NIGHT_ALPHA,
-                        zorder=5,
-                    )
-
-                    # Chevrons NIGHT ONLY + keep away from ends
-                    if not is_light:
-                        near_start = i < CHEVRON_SKIP_END_SEGMENTS
-                        near_end = i > (nseg - 1 - CHEVRON_SKIP_END_SEGMENTS)
-                        if (i % CHEVRON_EVERY_N_SEGMENTS == 0) and (not near_start) and (not near_end):
-                            heading = math.atan2((y1 - y0), (x1 - x0))
-                            _draw_chevron_night_only(
-                                ax,
-                                (x0 + x1) / 2.0,
-                                (y0 + y1) / 2.0,
-                                heading,
-                                colour
-                            )
-
-    fig.tight_layout()
-    return fig
-
-
-def build_png_bytes(run_date: date) -> bytes:
-    fig = _make_map(run_date)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=170)
+    fig.savefig(buf, format="png", dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
 
-# -------------------- WEB --------------------
+# ============================================================
+# GeoJSON Renderer
+# ============================================================
+
+def render_map_geojson(date_str, dir_param):
+    run_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    z = get_gtfs_zip()
+    routes = read_txt(z, "routes.txt")
+    trips = read_txt(z, "trips.txt")
+    stop_times = read_txt(z, "stop_times.txt")
+    stops = read_txt(z, "stops.txt")
+    calendar = read_txt(z, "calendar.txt")
+
+    yyyymmdd = run_date.strftime("%Y%m%d")
+    active = {r["service_id"] for _, r in calendar.iterrows() if service_active_on(r, yyyymmdd)}
+
+    routes = routes[routes["route_long_name"].isin(LONG_DISTANCE_NAMES)]
+    trips = trips[trips["service_id"].isin(active)]
+    trips = trips.merge(routes[["route_id","route_long_name"]], on="route_id")
+
+    stop_times = stop_times[stop_times["trip_id"].isin(trips["trip_id"])]
+    stop_times["arr_sec"] = stop_times["arrival_time"].apply(parse_gtfs_time)
+    stop_times["dep_sec"] = stop_times["departure_time"].apply(parse_gtfs_time)
+    stop_times = stop_times.sort_values(["trip_id","stop_sequence"])
+
+    stops = stops[["stop_id","stop_lat","stop_lon","stop_timezone"]]
+    stops["stop_timezone"] = stops["stop_timezone"].fillna("UTC")
+
+    reps = pick_representative_trips(trips, stop_times)
+    direction_id = direction_id_from_param(dir_param)
+
+    features = []
+
+    for rname in LONG_DISTANCE_NAMES:
+        key = (rname, direction_id)
+        if key not in reps:
+            continue
+
+        trip_id = reps[key]
+        st = stop_times[stop_times["trip_id"] == trip_id].merge(stops, on="stop_id")
+        if len(st) < 2:
+            continue
+
+        for i in range(len(st) - 1):
+            a, b = st.iloc[i], st.iloc[i+1]
+            if a["dep_sec"] is None or b["arr_sec"] is None:
+                continue
+
+            mid = int((a["dep_sec"] + b["arr_sec"]) / 2)
+            dt = datetime(run_date.year, run_date.month, run_date.day) + timedelta(seconds=mid)
+            try:
+                dt = pytz.timezone(a["stop_timezone"]).localize(dt)
+            except Exception:
+                dt = pytz.UTC.localize(dt)
+
+            daylight = is_daylight(
+                (a["stop_lat"] + b["stop_lat"]) / 2,
+                (a["stop_lon"] + b["stop_lon"]) / 2,
+                a["stop_timezone"],
+                dt
+            )
+
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "route": rname,
+                    "direction": direction_label(dir_param),
+                    "date": date_str,
+                    "day": bool(daylight)
+                },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [a["stop_lon"], a["stop_lat"]],
+                        [b["stop_lon"], b["stop_lat"]]
+                    ]
+                }
+            })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features
+    }
+
+
+# ============================================================
+# Flask app
+# ============================================================
+
+app = Flask(__name__)
+
 
 @app.get("/")
-def index():
-    d = request.args.get("date", "2026-02-06").strip()
-    html = f"""
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Amtrak Daylight Map</title>
-      <style>
-        body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; }}
-        .top {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom: 12px; }}
-        .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 12px; }}
-        img {{ width: 100%; height: auto; display: block; border-radius: 6px; }}
-        input {{ padding: 8px 10px; border-radius: 8px; border: 1px solid #ccc; }}
-        button {{ padding: 8px 12px; border-radius: 8px; border: 1px solid #aaa; background: #f7f7f7; }}
-      </style>
-    </head>
-    <body>
-      <div class="top">
-        <h2 style="margin:0;">Amtrak Daylight Map</h2>
-        <form method="get" action="/" style="margin:0;">
-          <label>Date (YYYY-MM-DD): </label>
-          <input type="date" name="date" value="{d}" min="2025-01-01" max="2027-12-31" />
-          <button type="submit">Update</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <img src="/map.png?date={d}" alt="Amtrak map">
-      </div>
-    </body>
-    </html>
-    """
-    return Response(html, mimetype="text/html")
+def home():
+    return {"ok": True}
 
 
-@app.get("/map.png")
+@app.get("/amtrak-map.png")
 def map_png():
-    d = request.args.get("date", "").strip()
-    if not d:
-        abort(400, "Missing required query parameter: date=YYYY-MM-DD")
-    try:
-        run_date = datetime.strptime(d, "%Y-%m-%d").date()
-    except ValueError:
-        abort(400, "Invalid date format. Use YYYY-MM-DD (e.g. 2026-02-06).")
+    date_str = request.args.get("date")
+    dir_param = request.args.get("dir", "west")
+    if not date_str:
+        abort(400)
 
-    try:
-        png_bytes = build_png_bytes(run_date)
-    except Exception as e:
-        abort(500, f"Failed to generate PNG: {e}")
+    out = CACHE_DIR / f"amtrak_{date_str}_{dir_param}.png"
+    if out.exists():
+        return send_file(out, mimetype="image/png")
 
-    return Response(png_bytes, mimetype="image/png", headers={"Cache-Control": "public, max-age=300"})
+    png = render_map_png(date_str, dir_param)
+    out.write_bytes(png)
+    return make_response(png, 200, {"Content-Type": "image/png"})
+
+
+@app.get("/amtrak-map.geojson")
+def map_geojson():
+    date_str = request.args.get("date")
+    dir_param = request.args.get("dir", "west")
+    if not date_str:
+        abort(400)
+
+    out = CACHE_DIR / f"amtrak_{date_str}_{dir_param}.geojson"
+    if out.exists():
+        return send_file(out, mimetype="application/geo+json")
+
+    geo = render_map_geojson(date_str, dir_param)
+    data = json.dumps(geo).encode("utf-8")
+    out.write_bytes(data)
+    return Response(data, mimetype="application/geo+json")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
